@@ -1,0 +1,27 @@
+{
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string"
+            },
+            "major": {
+                "type": "string"
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            }
+        },
+        "required": [
+            "title",
+            "major",
+            "confidence"
+        ],
+        "additionalProperties": true
+    },
+    "minItems": 1,
+    "description": "新闻分类结果数组"
+}

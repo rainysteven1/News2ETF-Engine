@@ -1,0 +1,37 @@
+name: News2ETF-Engine
+services:
+  loki:
+    image: grafana/loki:3.5.10
+    container_name: News2ETF-Engine-loki
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "43100:3100"
+    volumes:
+      - ./manifests/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: News2ETF-Engine-grafana
+    restart: always
+    ports:
+      - "43000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./manifests/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - loki
+
+volumes:
+  grafana_data:
+  loki_data:

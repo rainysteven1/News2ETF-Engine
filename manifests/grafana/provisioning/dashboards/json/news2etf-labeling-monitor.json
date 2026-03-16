@@ -1,0 +1,175 @@
+{
+    "annotations": {
+        "list": [
+            {
+                "builtIn": 1,
+                "datasource": {
+                    "type": "grafana",
+                    "uid": "-- Grafana --"
+                },
+                "enable": true,
+                "hide": true,
+                "iconColor": "rgba(0, 211, 255, 1)",
+                "name": "Annotations & Alerts",
+                "type": "dashboard"
+            }
+        ]
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 1,
+    "id": null,
+    "links": [],
+    "panels": [
+        {
+            "title": "Labeling Runs Overview",
+            "type": "table",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(count_over_time({app=\"news2etf\"} [$__range])) by (run_id, level_stage, component)",
+                    "legendFormat": "",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "transformations": [
+                {
+                    "id": "labelsToFields",
+                    "options": {}
+                }
+            ]
+        },
+        {
+            "title": "Log Rate (lines/min)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 8
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(rate({app=\"news2etf\"} [$__auto])) by (component)",
+                    "legendFormat": "{{component}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "cpm"
+                }
+            }
+        },
+        {
+            "title": "Error Rate",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 8
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(rate({app=\"news2etf\"} |~ `ERROR|CRITICAL` [$__auto])) by (run_id)",
+                    "legendFormat": "errors {{run_id}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "fixedColor": "red",
+                        "mode": "fixed"
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Log Lines per Run",
+            "type": "barchart",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 16
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(count_over_time({app=\"news2etf\"} [$__range])) by (run_id, level_stage)",
+                    "legendFormat": "{{run_id}} ({{level_stage}})",
+                    "refId": "A",
+                    "instant": true
+                }
+            ]
+        }
+    ],
+    "schemaVersion": 39,
+    "tags": [
+        "news2etf",
+        "loki",
+        "monitoring"
+    ],
+    "templating": {
+        "list": [
+            {
+                "name": "DS_LOKI",
+                "type": "datasource",
+                "query": "loki",
+                "current": {
+                    "selected": true,
+                    "text": "Loki",
+                    "value": "Loki"
+                }
+            }
+        ]
+    },
+    "time": {
+        "from": "now-6h",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "News2ETF - Labeling Monitor",
+    "uid": "news2etf-labeling-monitor",
+    "version": 1
+}

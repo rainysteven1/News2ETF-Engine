@@ -1,0 +1,40 @@
+{
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "原始新闻标题"
+            },
+            "sub": {
+                "type": "string",
+                "description": "细分行业标签（用于微调分类模型）"
+            },
+            "sentiment": {
+                "type": "string",
+                "enum": [
+                    "利好",
+                    "中性",
+                    "利空"
+                ],
+                "description": "情感极性（用于对比 FinBERT 自带情感分析）"
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "模型对该分类的置信度"
+            }
+        },
+        "required": [
+            "title",
+            "sub",
+            "sentiment",
+            "confidence"
+        ],
+        "additionalProperties": false
+    },
+    "minItems": 1,
+    "description": "金融新闻结构化标注结果列表"
+}

@@ -1,0 +1,261 @@
+{
+    "annotations": {
+        "list": [
+            {
+                "builtIn": 1,
+                "datasource": {
+                    "type": "grafana",
+                    "uid": "-- Grafana --"
+                },
+                "enable": true,
+                "hide": true,
+                "iconColor": "rgba(0, 211, 255, 1)",
+                "name": "Annotations & Alerts",
+                "type": "dashboard"
+            }
+        ]
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 1,
+    "id": null,
+    "links": [],
+    "panels": [
+        {
+            "title": "Log Volume by Run",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "bars",
+                        "fillOpacity": 50,
+                        "stacking": {
+                            "mode": "normal"
+                        }
+                    }
+                },
+                "overrides": []
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(count_over_time({app=\"news2etf\", run_id=~\"$run_id\"} [$__auto])) by (run_id)",
+                    "legendFormat": "{{run_id}}",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "right"
+                }
+            }
+        },
+        {
+            "title": "Log Volume by Level Stage",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 8
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "bars",
+                        "fillOpacity": 50,
+                        "stacking": {
+                            "mode": "normal"
+                        }
+                    }
+                },
+                "overrides": []
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "sum(count_over_time({app=\"news2etf\", level_stage=~\"$level_stage\"} [$__auto])) by (level_stage)",
+                    "legendFormat": "{{level_stage}}",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "right"
+                }
+            }
+        },
+        {
+            "title": "Live Log Stream",
+            "type": "logs",
+            "gridPos": {
+                "h": 18,
+                "w": 24,
+                "x": 0,
+                "y": 16
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "{app=\"news2etf\", run_id=~\"$run_id\", level_stage=~\"$level_stage\"} |= `$search`",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "showTime": true,
+                "sortOrder": "Descending",
+                "dedupStrategy": "none",
+                "enableLogDetails": true,
+                "prettifyLogMessage": false,
+                "wrapLogMessage": true
+            }
+        },
+        {
+            "title": "Error Logs",
+            "type": "logs",
+            "gridPos": {
+                "h": 12,
+                "w": 24,
+                "x": 0,
+                "y": 34
+            },
+            "datasource": {
+                "type": "loki",
+                "uid": "${DS_LOKI}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "loki",
+                        "uid": "${DS_LOKI}"
+                    },
+                    "expr": "{app=\"news2etf\", run_id=~\"$run_id\"} |~ `ERROR|CRITICAL|failed`",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "showTime": true,
+                "sortOrder": "Descending",
+                "enableLogDetails": true,
+                "wrapLogMessage": true
+            }
+        }
+    ],
+    "schemaVersion": 39,
+    "tags": [
+        "news2etf",
+        "loki",
+        "logs"
+    ],
+    "templating": {
+        "list": [
+            {
+                "name": "DS_LOKI",
+                "type": "datasource",
+                "query": "loki",
+                "current": {
+                    "selected": true,
+                    "text": "Loki",
+                    "value": "Loki"
+                }
+            },
+            {
+                "name": "run_id",
+                "type": "query",
+                "datasource": {
+                    "type": "loki",
+                    "uid": "${DS_LOKI}"
+                },
+                "query": {
+                    "label": "run_id",
+                    "stream": "{app=\"news2etf\"}",
+                    "type": 1
+                },
+                "refresh": 2,
+                "includeAll": true,
+                "multi": true,
+                "current": {
+                    "selected": true,
+                    "text": "All",
+                    "value": "$__all"
+                }
+            },
+            {
+                "name": "level_stage",
+                "type": "query",
+                "datasource": {
+                    "type": "loki",
+                    "uid": "${DS_LOKI}"
+                },
+                "query": {
+                    "label": "level_stage",
+                    "stream": "{app=\"news2etf\"}",
+                    "type": 1
+                },
+                "refresh": 2,
+                "includeAll": true,
+                "multi": true,
+                "current": {
+                    "selected": true,
+                    "text": "All",
+                    "value": "$__all"
+                }
+            },
+            {
+                "name": "search",
+                "type": "textbox",
+                "current": {
+                    "selected": false,
+                    "text": "",
+                    "value": ""
+                },
+                "label": "Search",
+                "description": "Full-text search in log lines"
+            }
+        ]
+    },
+    "time": {
+        "from": "now-3h",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "News2ETF - Log Explorer",
+    "uid": "news2etf-log-explorer",
+    "version": 1
+}

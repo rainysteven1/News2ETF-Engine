@@ -1,0 +1,13 @@
+.venv/
+.cache/
+.git/
+wandb/
+logs/
+checkpoints/
+data/
+**/__pycache__/
+*.py.bak
+*.pyc
+.env
+.idea/
+.vscode/

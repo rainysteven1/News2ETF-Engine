@@ -1,0 +1,12 @@
+[loki]
+url = "http://localhost:43100"
+
+[labeling.level1]
+model = "glm-4.5-airx"
+temperature = 0.1
+max_tokens = 8192
+
+[labeling.level2]
+model = "glm-4.7-flashx"
+temperature = 0.1
+max_tokens = 4096
