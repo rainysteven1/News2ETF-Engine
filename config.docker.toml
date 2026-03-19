@@ -1,0 +1,10 @@
+[database]
+type = "postgresql"
+ip = "postgres"
+port = 5432
+user = "news2etf"
+password = "news2etf_password"
+db = "news2etf"
+
+[loki]
+url = "http://loki:3100"

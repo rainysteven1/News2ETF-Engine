@@ -1,32 +1,41 @@
 """
 Label news articles with hierarchical industry categories and sentiment.
 
+Pure business logic — no infrastructure setup.
+Logging sinks, checkpoint handlers, and stores are injected by the caller.
+
 Pipeline:
   1. Keyword matching on title → high-confidence hits (~60-70%)
   2. Remaining ambiguous titles → batch LLM via GLM-4-Flash
   3. Results written to DuckDB news_classified table
 """
 
+from __future__ import annotations
+
 import json
 import re
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
 from random import sample as random_sample
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import jsonschema
 import yaml
 from loguru import logger
+from pydantic import BaseModel
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from zhipuai import ZhipuAI
 
-from src.common import CONFIGS_DIR, console, get_labeling_config, get_loki_url
-from src.common.tracking import save_checkpoint
-from src.store import batch_update_labels, sample_unlabeled, save_labels
-from src.utils.loki_sink import LokiSink
+from src.common import CONFIGS_DIR, console
+
+if TYPE_CHECKING:
+    from src.db.store import DuckDBStore
+
+# Type alias: (run_id, stage, batch_idx, saved_count) -> None
+CheckpointFn = Callable[[str | None, str, int, int], None]
 
 LLM_BATCH_SIZE = 20
 CHECKPOINT_EVERY = 5  # save checkpoint every N batches
@@ -92,64 +101,22 @@ _LEVEL1_ITEM_SCHEMA: dict = _LEVEL1_SCHEMA["items"]
 _LEVEL2_ITEM_SCHEMA: dict = _LEVEL2_SCHEMA["items"]
 
 
-# ──────────────────────────────────────────────
-# Loki logging setup
-# ──────────────────────────────────────────────
-
-logger.remove()  # suppress default stderr output so Rich progress bars stay clean
-
-_loki_sink: LokiSink | None = None
-
-
-def setup_loki_logging(run_id: str | None, level: str = "labeling") -> int | None:
-    """Add a Loki sink with run_id label. Returns handler ID for cleanup."""
-    global _loki_sink
-    loki_url = get_loki_url()
-    if not loki_url:
-        logger.info("Loki URL not configured, skipping Loki logging")
-        return None
-
-    rid = run_id or "unknown"
-    _loki_sink = LokiSink(
-        url=loki_url,
-        labels={
-            "app": "news2etf",
-            "component": "labeling",
-            "level_stage": level,
-            "run_id": rid,
-        },
-    )
-    handler_id = logger.add(
-        _loki_sink.write,
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<5} | {message}",
-    )
-    logger.info(f"Loki logging enabled → {loki_url}  run_id={rid}")
-    return handler_id
-
-
-def teardown_loki_logging(handler_id: int | None) -> None:
-    """Flush and remove the Loki sink."""
-    global _loki_sink
-    if _loki_sink is not None:
-        _loki_sink.stop()
-        _loki_sink = None
-    if handler_id is not None:
-        logger.remove(handler_id)
-
-
 def _flush_checkpoint(
     con: duckdb.DuckDBPyConnection,
     results: list[dict],
     run_id: str | None,
     stage: str,
     batch_idx: int,
+    *,
+    store: DuckDBStore,
+    checkpoint_fn: CheckpointFn | None = None,
 ) -> int:
-    """Flush accumulated results to DuckDB and record checkpoint in SQLite."""
+    """Flush accumulated results to DuckDB and optionally record checkpoint."""
     if not results:
         return 0
-    saved = save_labels(con, results)
-    save_checkpoint(run_id, stage, batch_idx, saved)
+    saved = store.save_labels(con, results)
+    if checkpoint_fn:
+        checkpoint_fn(run_id, stage, batch_idx, saved)
     logger.info(f"Checkpoint [{stage}] batch={batch_idx} saved={saved}")
     return saved
 
@@ -212,8 +179,7 @@ def _keyword_classify_sub(title: str, major: str) -> tuple[str, float] | None:
 # ──────────────────────────────────────────────
 
 
-@dataclass
-class LLMUsage:
+class LLMUsage(BaseModel):
     """Accumulated token usage statistics across LLM batches."""
 
     total_tokens: int = 0
@@ -329,24 +295,23 @@ def _parse_llm_json(content: str, item_schema: dict | None = None) -> list[dict]
     return valid
 
 
-def _llm_classify_level1(client: ZhipuAI, titles: list[str]) -> tuple[list[dict], dict]:
+def _llm_classify_level1(client: ZhipuAI, titles: list[str], config: dict[str, Any]) -> tuple[list[dict], dict]:
     t0 = time.time()
     logger.info(f"LLM level-1 request: {len(titles)} titles")
     for i, t in enumerate(titles):
         logger.debug(f"  sample {i + 1}: {t}")
     try:
-        cfg = get_labeling_config(1)
         system_prompt = _load_level1_prompt(all_major_categories)
         titles_str = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
         response = client.chat.completions.create(
-            model=cfg["model"],
+            model=config["model"],
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"请分类以下新闻标题：\n{titles_str}"},
             ],
-            temperature=cfg["temperature"],
+            temperature=config["temperature"],
             response_format={"type": "json_object"},
-            max_tokens=cfg["max_tokens"],
+            max_tokens=config["max_tokens"],
         )
         elapsed = time.time() - t0
 
@@ -362,23 +327,27 @@ def _llm_classify_level1(client: ZhipuAI, titles: list[str]) -> tuple[list[dict]
         raise
 
 
-def _llm_classify_level2(client: ZhipuAI, titles: list[str], major: str) -> tuple[list[dict], dict]:
+def _llm_classify_level2(
+    client: ZhipuAI,
+    titles: list[str],
+    major: str,
+    config: dict[str, Any],
+) -> tuple[list[dict], dict]:
     t0 = time.time()
     logger.info(f"LLM level-2 request [{major}]: {len(titles)} titles")
     for i, t in enumerate(titles):
         logger.debug(f"  sample {i + 1}: {t}")
     try:
-        cfg = get_labeling_config(2)
         system_prompt = _load_level2_prompt(major, hierarchy[major])
         titles_str = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
         response = client.chat.completions.create(
-            model=cfg["model"],
+            model=config["model"],
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"请分类以下新闻标题：\n{titles_str}"},
             ],
-            temperature=cfg["temperature"],
-            max_tokens=cfg["max_tokens"],
+            temperature=config["temperature"],
+            max_tokens=config["max_tokens"],
         )
         elapsed = time.time() - t0
         usage = _extract_usage(response)
@@ -412,13 +381,22 @@ def run_level1(
     client: ZhipuAI,
     sample_size: int,
     *,
+    config: dict[str, Any],
+    store: DuckDBStore,
     run_id: str | None = None,
+    task_id: str | None = None,
+    seed: int | None = None,
+    checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
-    loki_handler = setup_loki_logging(run_id, level="level1")
     console.print(f"\n[bold]Level-1 major-category labeling[/bold] (sample [cyan]{sample_size}[/cyan])")
 
-    df = sample_unlabeled(con, sample_size)
-    console.print(f"Fetched [bold]{len(df)}[/bold] unlabeled records (ordered by datetime)")
+    current_task_id = task_id or "unknown"
+    console.print(f"  Task ID: [cyan]{current_task_id[:12]}...[/cyan]")
+
+    # Sample from news_raw; seed makes the sample deterministic across ablation runs
+    df = store.sample_news(con, sample_size, seed=seed)
+    seed_note = f" seed={seed}" if seed is not None else ""
+    console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}")
 
     keyword_results: list[dict] = []
     llm_pending: list[dict] = []
@@ -444,6 +422,7 @@ def run_level1(
                         "sentiment": None,
                         "confidence": conf,
                         "label_source": "keyword",
+                        "task_id": current_task_id,
                     }
                 )
             else:
@@ -459,7 +438,15 @@ def run_level1(
     # Save keyword results immediately as checkpoint
     total_saved = 0
     if keyword_results:
-        total_saved += _flush_checkpoint(con, keyword_results, run_id, "level1-keyword", 0)
+        total_saved += _flush_checkpoint(
+            con,
+            keyword_results,
+            run_id,
+            "level1-keyword",
+            0,
+            store=store,
+            checkpoint_fn=checkpoint_fn,
+        )
         console.print(f"  [dim]Checkpoint: saved {total_saved} keyword results[/dim]")
 
     # Phase 2: LLM fallback
@@ -479,7 +466,7 @@ def run_level1(
             batch = llm_pending[i : i + LLM_BATCH_SIZE]
             try:
                 titles = [r["title"] for r in batch]
-                results, usage = _llm_classify_level1(client, titles)
+                results, usage = _llm_classify_level1(client, titles, config)
                 llm_usage.add(usage, usage.get("_elapsed", 0))
                 for j, r in enumerate(results):
                     if j < len(batch):
@@ -494,6 +481,7 @@ def run_level1(
                                     "sentiment": None,
                                     "confidence": r.get("confidence", 0.5),
                                     "label_source": "llm",
+                                    "task_id": current_task_id,
                                 }
                             )
             except Exception as e:
@@ -503,7 +491,15 @@ def run_level1(
 
             # Checkpoint every N batches
             if batch_count % CHECKPOINT_EVERY == 0 and llm_batch_results:
-                total_saved += _flush_checkpoint(con, llm_batch_results, run_id, "level1-llm", batch_count)
+                total_saved += _flush_checkpoint(
+                    con,
+                    llm_batch_results,
+                    run_id,
+                    "level1-llm",
+                    batch_count,
+                    store=store,
+                    checkpoint_fn=checkpoint_fn,
+                )
                 llm_batch_results = []
 
             if i + LLM_BATCH_SIZE < len(llm_pending):
@@ -511,7 +507,15 @@ def run_level1(
 
     # Flush remaining
     if llm_batch_results:
-        total_saved += _flush_checkpoint(con, llm_batch_results, run_id, "level1-llm", batch_count)
+        total_saved += _flush_checkpoint(
+            con,
+            llm_batch_results,
+            run_id,
+            "level1-llm",
+            batch_count,
+            store=store,
+            checkpoint_fn=checkpoint_fn,
+        )
 
     console.print(f"[bold green]✓ Level-1 done[/bold green] — saved [bold]{total_saved}[/bold] labels")
     llm_usage.print_summary("Level-1")
@@ -528,7 +532,7 @@ def run_level1(
         verify_titles = [r["title"] for r in verify_sample]
         mismatches = 0
         try:
-            llm_results_verify, _verify_usage = _llm_classify_level1(client, verify_titles)
+            llm_results_verify, _verify_usage = _llm_classify_level1(client, verify_titles, config)
             llm_usage.add(_verify_usage, _verify_usage.get("_elapsed", 0))
             for i, r in enumerate(llm_results_verify):
                 if i < len(verify_sample):
@@ -553,28 +557,38 @@ def run_level1(
                 f"  [yellow]Consider tuning configs/major_keywords.yaml and rerun.[/yellow]"
             )
 
-    teardown_loki_logging(loki_handler)
-
 
 def run_level2(
     con: duckdb.DuckDBPyConnection,
     client: ZhipuAI,
     sample_size: int,
     *,
+    config: dict[str, Any],
+    store: DuckDBStore,
     run_id: str | None = None,
+    task_id: str | None = None,
+    seed: int | None = None,
+    checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
-    loki_handler = setup_loki_logging(run_id, level="level2")
     console.print(f"\n[bold]Level-2 sub-category + sentiment labeling[/bold] (sample [cyan]{sample_size}[/cyan])")
 
-    df = con.execute(f"""
+    current_task_id = task_id or "unknown"
+    console.print(f"  Task ID: [cyan]{current_task_id[:12]}...[/cyan]")
+
+    # Fetch only this task's level-1 results that still need sub-category labeling
+    df = con.execute(
+        f"""
         SELECT c.news_id, c.title, c.major_category
         FROM news_classified c
-        JOIN news_raw r ON c.news_id = r.news_id
-        WHERE c.major_category IS NOT NULL AND c.sub_category IS NULL
-        ORDER BY r.datetime, c.news_id
+        WHERE c.task_id = ?
+          AND c.major_category IS NOT NULL
+          AND c.sub_category IS NULL
+        ORDER BY c.news_id
         LIMIT {sample_size}
-    """).pl()
-    console.print(f"Fetched [bold]{len(df)}[/bold] records pending sub-category labeling")
+    """,
+        [current_task_id],
+    ).pl()
+    console.print(f"Fetched [bold]{len(df)}[/bold] records pending sub-category labeling from news_classified")
 
     keyword_results: list[dict] = []
     single_sub_results: list[dict] = []
@@ -602,6 +616,7 @@ def run_level2(
                         "sentiment": None,
                         "confidence": 1.0,
                         "label_source": "auto",
+                        "task_id": current_task_id,
                     }
                 )
                 progress.advance(task)
@@ -619,6 +634,7 @@ def run_level2(
                         "sentiment": None,
                         "confidence": conf,
                         "label_source": "keyword",
+                        "task_id": current_task_id,
                     }
                 )
             else:
@@ -644,9 +660,11 @@ def run_level2(
             run_id,
             "level2-keyword",
             0,
+            store=store,
+            checkpoint_fn=checkpoint_fn,
         )
         # For keyword/auto results we need batch_update since rows exist
-        batch_update_labels(con, early_results)
+        store.batch_update_labels(con, early_results)
         console.print(f"  [dim]Checkpoint: saved {len(early_results)} keyword/auto results[/dim]")
 
     # Phase 2: LLM fallback per major
@@ -667,7 +685,7 @@ def run_level2(
                 batch = pending[i : i + LLM_BATCH_SIZE]
                 try:
                     titles = [r["title"] for r in batch]
-                    results, usage = _llm_classify_level2(client, titles, major)
+                    results, usage = _llm_classify_level2(client, titles, major, config)
                     llm_usage.add(usage, usage.get("_elapsed", 0))
                     for j, r in enumerate(results):
                         if j < len(batch):
@@ -682,6 +700,7 @@ def run_level2(
                                         "sentiment": r.get("sentiment", "中性"),
                                         "confidence": r.get("confidence", 0.5),
                                         "label_source": "llm",
+                                        "task_id": current_task_id,
                                     }
                                 )
                 except Exception as e:
@@ -691,8 +710,9 @@ def run_level2(
 
                 # Checkpoint every N batches
                 if batch_count % CHECKPOINT_EVERY == 0 and llm_batch_results:
-                    batch_update_labels(con, llm_batch_results)
-                    save_checkpoint(run_id, "level2-llm", batch_count, len(llm_batch_results))
+                    store.batch_update_labels(con, llm_batch_results)
+                    if checkpoint_fn:
+                        checkpoint_fn(run_id, "level2-llm", batch_count, len(llm_batch_results))
                     total_saved += len(llm_batch_results)
                     llm_batch_results = []
 
@@ -701,8 +721,9 @@ def run_level2(
 
     # Flush remaining LLM results
     if llm_batch_results:
-        batch_update_labels(con, llm_batch_results)
-        save_checkpoint(run_id, "level2-llm", batch_count, len(llm_batch_results))
+        store.batch_update_labels(con, llm_batch_results)
+        if checkpoint_fn:
+            checkpoint_fn(run_id, "level2-llm", batch_count, len(llm_batch_results))
         total_saved += len(llm_batch_results)
 
     console.print(
@@ -723,7 +744,7 @@ def run_level2(
         for major, group in _group_by_major(verify_sample).items():
             try:
                 titles = [r["title"] for r in group]
-                llm_res, _v_usage = _llm_classify_level2(client, titles, major)
+                llm_res, _v_usage = _llm_classify_level2(client, titles, major, config)
                 llm_usage.add(_v_usage, _v_usage.get("_elapsed", 0))
                 for i, r in enumerate(llm_res):
                     if i < len(group):
@@ -745,10 +766,8 @@ def run_level2(
                 f"  [yellow]Consider tuning configs/sub_keywords.yaml and rerun.[/yellow]"
             )
 
-    teardown_loki_logging(loki_handler)
 
-
-def print_label_stats(con: duckdb.DuckDBPyConnection, console: Console) -> None:
+def print_label_stats(con: duckdb.DuckDBPyConnection) -> None:
     stats = con.execute("""
         SELECT major_category, label_source, COUNT(*) AS cnt,
                ROUND(AVG(confidence), 3) AS avg_conf
