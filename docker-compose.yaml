@@ -56,6 +56,8 @@ services:
     container_name: News2ETF-Engine-app
     user: "1000:1000"
     restart: always
+    dns:
+      - 114.114.114.114
     ports:
       - "8040:8040"
     env_file:
@@ -63,6 +65,8 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - ENV_MODE=docker
+      - HTTPS_PROXY=http://172.19.0.1:8888
+      - NO_PROXY=postgres,loki,localhost,127.0.0.1
     volumes:
       - ./configs:/app/configs:ro
       - ./config.docker.toml:/app/config.docker.toml:ro

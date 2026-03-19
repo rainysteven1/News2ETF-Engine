@@ -30,10 +30,13 @@ def _setup_loki(run_id: str | None, level_stage: str) -> tuple[LokiSink | None, 
     Also raises the default stderr handler to INFO so that DEBUG messages
     (e.g. per-sample titles) only flow to Loki, not the console.
     """
-    # Suppress DEBUG from the default console handler (id 0)
-    logger.remove(0)
+    # Remove all existing handlers, then re-add stderr at INFO level so that
+    # DEBUG messages (e.g. per-sample titles) only flow to Loki, not the console.
+    import sys
+
+    logger.remove()
     logger.add(
-        __import__("sys").stderr,
+        sys.stderr,
         level="INFO",
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:<5}</level> | {message}",
     )
