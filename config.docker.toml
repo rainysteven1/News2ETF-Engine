@@ -1,0 +1,22 @@
+[database]
+type = "postgresql"
+ip = "postgres"
+port = 5432
+user = "news2etf"
+password = "news2etf_password"
+db = "news2etf"
+
+[loki]
+url = "http://loki:3100"
+
+[s3]
+endpoint = "http://seaweedfs:8333"
+access_key = "admin"
+secret_key = "admin123"
+
+[labeling]
+batch_size_l1 = 20
+batch_size_l2 = 20
+checkpoint_every = 5
+s3_bucket = "labeling"
+llm_retry = 2

@@ -5,12 +5,11 @@ Uses only stdlib (urllib) — no extra dependencies required.
 """
 
 import json
-import sys
 import time
 import urllib.request
 from threading import Lock, Thread
 
-from src.common.base import console
+from src.common.config import console
 
 
 class LokiSink:

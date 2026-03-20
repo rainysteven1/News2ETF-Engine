@@ -31,11 +31,15 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 
 COPY src/ ./src/
-COPY configs/ ./configs/
-COPY config.toml ./
-COPY main.py ./
+COPY alembic/ ./alembic/
+COPY alembic.ini main.py ./
+COPY config*.toml ./
 
 ENV PATH="/app/.venv/bin:$PATH" \
     VIRTUAL_ENV="/app/.venv" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+EXPOSE 8040
+
+CMD ["python", "main.py"]

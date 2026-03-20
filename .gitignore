@@ -21,3 +21,5 @@ experiments/*
 !experiments/metadata/
 logs/
 wandb/
+
+news2etf_swagger.json

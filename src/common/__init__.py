@@ -1,1 +1,1 @@
-from src.common.base import CONFIGS_DIR, DATA_DIR, ROOT_DIR, console, get_labeling_config, get_loki_url, load_config
+from src.common.config import CONFIGS_DIR, DATA_DIR, ROOT_DIR, console, get_config

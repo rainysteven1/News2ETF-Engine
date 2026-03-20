@@ -9,9 +9,9 @@ import json
 import time
 
 import polars as pl
+from openai import OpenAI
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
-from zhipuai import ZhipuAI
 
 from src.common import CONFIGS_DIR, DATA_DIR
 
@@ -41,7 +41,7 @@ def _parse_llm_json(content: str) -> dict:
     return json.loads(content.strip())
 
 
-def classify_batch(client: ZhipuAI, names: list[str], model: str) -> dict[str, dict[str, list[str]]]:
+def classify_batch(client: OpenAI, names: list[str], model: str) -> dict[str, dict[str, list[str]]]:
     system_prompt = _load_system_prompt()
     names_str = "\n".join(f"- {n}" for n in names)
     response = client.chat.completions.create(
@@ -70,7 +70,7 @@ def merge_dicts(
 
 
 def build_industry_dict(api_key: str, console: Console, model: str = DEFAULT_MODEL) -> None:
-    client = ZhipuAI(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     console.print(f"[bold cyan]读取跟踪指数名称...[/bold cyan]  模型: [magenta]{model}[/magenta]")
     all_names = get_unique_index_names()
