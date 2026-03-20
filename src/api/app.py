@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from loguru import logger
 
 from alembic import command
-from src.api.routers import data, experiments, industry, tasks
+from src.api.routers import data, experiments, industry, labeling, tasks
 from src.common.config import ROOT_DIR
 
 # Controlled by main.py CLI; default True so `uvicorn src.api.app:app` still migrates.
@@ -63,6 +63,7 @@ def create_app() -> FastAPI:
 
     app.include_router(experiments.router, prefix="/experiments", tags=["experiments"])
     app.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
+    app.include_router(labeling.router, prefix="/labeling", tags=["labeling"])
     app.include_router(data.router, prefix="/data", tags=["data"])
     app.include_router(industry.router, prefix="/industry", tags=["industry"])
 

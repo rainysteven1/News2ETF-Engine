@@ -5,7 +5,6 @@ Uses only stdlib (urllib) — no extra dependencies required.
 """
 
 import json
-import sys
 import time
 import urllib.request
 from threading import Lock, Thread

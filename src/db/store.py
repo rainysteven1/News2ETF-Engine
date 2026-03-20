@@ -123,12 +123,18 @@ class DuckDBStore:
             LIMIT {n}
         """).pl()
 
-    def sample_news(self, con: duckdb.DuckDBPyConnection, n: int, seed: int | None = None) -> pl.DataFrame:
+    def sample_news(
+        self, con: duckdb.DuckDBPyConnection, n: int, seed: int | None = None, offset: int = 0
+    ) -> pl.DataFrame:
         """Sample n rows from news_raw.
 
         When *seed* is provided the sample is deterministic (same rows every
         run), which is required for ablation experiments so all tasks operate
         on identical data.  Without a seed the rows are ordered by datetime.
+
+        *offset* skips the first N rows (datetime order) and is only applied
+        when *seed* is None — useful for continuation tasks that resume after
+        a partial run.
         """
         if seed is not None:
             return con.execute(f"""
@@ -144,7 +150,7 @@ class DuckDBStore:
             FROM news_raw
             WHERE title IS NOT NULL AND LENGTH(title) > 5
             ORDER BY datetime, news_id
-            LIMIT {n}
+            LIMIT {n} OFFSET {offset}
         """).pl()
 
     def save_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict]) -> int:
@@ -188,6 +194,29 @@ class DuckDBStore:
         """)
         con.commit()
         return len(labels)
+
+    def merge_classified(self, con: duckdb.DuckDBPyConnection, source_task_ids: list[str], target_task_id: str) -> int:
+        """Copy all level-1 labels from source tasks into target_task_id.
+
+        Duplicate news_ids are silently skipped (INSERT OR IGNORE).
+        All source_task_ids must be pre-validated UUIDs.
+        """
+        if not source_task_ids:
+            return 0
+        id_placeholders = ", ".join(["?"] * len(source_task_ids))
+        con.execute(
+            f"""
+            INSERT OR IGNORE INTO news_classified
+                (news_id, title, major_category, confidence, label_source, task_id)
+            SELECT news_id, title, major_category, confidence, label_source, ?
+            FROM news_classified
+            WHERE task_id IN ({id_placeholders})
+            """,
+            [target_task_id, *source_task_ids],
+        )
+        con.commit()
+        count = con.execute("SELECT COUNT(*) FROM news_classified WHERE task_id = ?", [target_task_id]).fetchone()[0]  # type: ignore
+        return count
 
     def export_training_data(
         self,

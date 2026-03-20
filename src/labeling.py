@@ -12,21 +12,18 @@ Pipeline:
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from collections.abc import Callable
 from random import sample as random_sample
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal
 
 import duckdb
-import jsonschema
 import yaml
 from loguru import logger
-from pydantic import BaseModel
+from openai import OpenAI
+from pydantic import BaseModel, Field
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
-from zhipuai import ZhipuAI
 
 from src.common import CONFIGS_DIR, console, get_config
 from src.utils.s3_client import upload_json as _s3_upload_json
@@ -45,6 +42,11 @@ def _labeling_cfg():
 # ──────────────────────────────────────────────
 # LLM parse-error diagnostics
 # ──────────────────────────────────────────────
+
+
+class InsufficientBalanceError(RuntimeError):
+    """Raised when the API rejects a request due to insufficient balance (error code 1113).
+    Further requests will fail identically, so the pipeline terminates immediately."""
 
 
 class LLMParseError(Exception):
@@ -119,21 +121,15 @@ def _load_sub_keywords() -> dict[str, list[str]]:
 
 
 def _load_level1_prompt(major_categories: list[str]) -> str:
-    template = (CONFIGS_DIR / "prompts" / "label_level1_system.txt").read_text(encoding="utf-8").strip()
-    schema_str = json.dumps(_LEVEL1_SCHEMA, indent=2, ensure_ascii=False)
-    return template.replace("{major_categories}", json.dumps(major_categories, ensure_ascii=False)).replace(
-        "{schema}", schema_str
-    )
+    template = (CONFIGS_DIR / "prompts" / "label_level1_system.md").read_text(encoding="utf-8").strip()
+    categories_yaml = yaml.dump(major_categories, allow_unicode=True, default_flow_style=False).strip()
+    return template.replace("{major_categories}", categories_yaml)
 
 
 def _load_level2_prompt(major: str, subs: list[str]) -> str:
-    template = (CONFIGS_DIR / "prompts" / "label_level2_system.txt").read_text(encoding="utf-8").strip()
-    schema_str = json.dumps(_LEVEL2_SCHEMA, indent=2, ensure_ascii=False)
-    return (
-        template.replace("{major}", major)
-        .replace("{subs}", json.dumps(subs, ensure_ascii=False))
-        .replace("{schema}", schema_str)
-    )
+    template = (CONFIGS_DIR / "prompts" / "label_level2_system.md").read_text(encoding="utf-8").strip()
+    subs_yaml = yaml.dump(subs, allow_unicode=True, default_flow_style=False).strip()
+    return template.replace("{major}", major).replace("{subs}", subs_yaml)
 
 
 # ──────────────────────────────────────────────
@@ -155,11 +151,26 @@ _single_sub_majors: dict[str, str] = {major: subs[0] for major, subs in hierarch
 # JSON Schema (loaded once from config files)
 # ──────────────────────────────────────────────
 
-_LEVEL1_SCHEMA: dict = json.loads((CONFIGS_DIR / "prompts" / "label_level1_schema.json").read_text(encoding="utf-8"))
-_LEVEL2_SCHEMA: dict = json.loads((CONFIGS_DIR / "prompts" / "label_level2_schema.json").read_text(encoding="utf-8"))
-# Extract per-item schema for response validation
-_LEVEL1_ITEM_SCHEMA: dict = _LEVEL1_SCHEMA["items"]
-_LEVEL2_ITEM_SCHEMA: dict = _LEVEL2_SCHEMA["items"]
+
+class Level1Item(BaseModel):
+    title: str = Field(description="原始新闻标题")
+    major: str = Field(description="一级行业标签（用于训练新闻分类模型）")
+    confidence: float = Field(ge=0.0, le=1.0, description="模型对该分类的置信度")
+
+
+class Level1AnalysisResult(BaseModel):
+    items: list[Level1Item] = Field(min_length=1, description="新闻分类结果数组")
+
+
+class Level2Item(BaseModel):
+    title: str = Field(description="原始新闻标题")
+    sub: str = Field(description="细分行业标签（用于微调分类模型）")
+    sentiment: Literal["利好", "中性", "利空"] = Field(description="情感极性（用于对比 FinBERT 自带情感分析）")
+    confidence: float = Field(ge=0, le=1, description="模型对该分类的置信度")
+
+
+class Level2AnalysisResult(BaseModel):
+    items: list[Level2Item] = Field(min_length=1, description="金融新闻结构化标注结果列表")
 
 
 def _flush_checkpoint(
@@ -180,6 +191,35 @@ def _flush_checkpoint(
         checkpoint_fn(run_id, stage, batch_idx, saved)
     logger.info(f"Checkpoint [{stage}] batch={batch_idx} saved={saved}")
     return saved
+
+
+# ──────────────────────────────────────────────
+# Labeling pipeline configs
+# ──────────────────────────────────────────────
+
+
+class LabelingConfig(BaseModel):
+    """Shared LLM parameters for both labeling levels."""
+
+    model: str
+    temperature: float
+    max_tokens: int | None = None
+    checkpoint_every: int
+    llm_retry: int
+    seed: int | None = None
+
+
+class Level1Config(LabelingConfig):
+    """Config for level-1 major-category labeling."""
+
+    start: int = 0
+    batch_size: int  # formerly batch_size_l1
+
+
+class Level2Config(LabelingConfig):
+    """Config for level-2 sub-category + sentiment labeling."""
+
+    batch_size: int  # formerly batch_size_l2
 
 
 # ──────────────────────────────────────────────
@@ -250,13 +290,26 @@ class LLMUsage(BaseModel):
     batches: int = 0
     total_time: float = 0.0
 
-    def add(self, usage: dict, elapsed: float) -> None:
-        self.total_tokens += usage.get("total_tokens", 0)
-        self.prompt_tokens += usage.get("prompt_tokens", 0)
-        self.completion_tokens += usage.get("completion_tokens", 0)
-        self.cached_tokens += usage.get("cached_tokens", 0)
-        self.batches += 1
-        self.total_time += elapsed
+    @classmethod
+    def from_response(cls, response: object, elapsed: float) -> LLMUsage:
+        inst = cls(total_time=elapsed, batches=1)
+        resp_usage = getattr(response, "usage", None)
+        if resp_usage is not None:
+            inst.total_tokens = getattr(resp_usage, "total_tokens", 0) or 0
+            inst.prompt_tokens = getattr(resp_usage, "prompt_tokens", 0) or 0
+            inst.completion_tokens = getattr(resp_usage, "completion_tokens", 0) or 0
+            details = getattr(resp_usage, "prompt_tokens_details", None)
+            if details is not None:
+                inst.cached_tokens = getattr(details, "cached_tokens", 0) or 0
+        return inst
+
+    def add(self, other: LLMUsage) -> None:
+        self.total_tokens += other.total_tokens
+        self.prompt_tokens += other.prompt_tokens
+        self.completion_tokens += other.completion_tokens
+        self.cached_tokens += other.cached_tokens
+        self.batches += other.batches
+        self.total_time += other.total_time
 
     def print_summary(self, title: str) -> None:
         if self.batches == 0:
@@ -275,98 +328,18 @@ class LLMUsage(BaseModel):
         )
 
 
-def _extract_usage(response: object) -> dict[str, Any]:
-    """Safely extract token usage from a ZhipuAI response."""
-    usage: dict = {
-        "total_tokens": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "cached_tokens": 0,
-    }
-    resp_usage = getattr(response, "usage", None)
-    if resp_usage is None:
-        return usage
-    usage["total_tokens"] = getattr(resp_usage, "total_tokens", 0) or 0
-    usage["prompt_tokens"] = getattr(resp_usage, "prompt_tokens", 0) or 0
-    usage["completion_tokens"] = getattr(resp_usage, "completion_tokens", 0) or 0
-    # cached_tokens may live under prompt_tokens_details
-    details = getattr(resp_usage, "prompt_tokens_details", None)
-    if details is not None:
-        usage["cached_tokens"] = getattr(details, "cached_tokens", 0) or 0
-    return usage
-
-
-def _parse_llm_json(content: str, item_schema: dict | None = None) -> list[dict]:
-    """Parse LLM JSON response with tolerance for common formatting errors.
-
-    If *item_schema* is provided, each element is validated against it;
-    items that fail validation are dropped with a warning instead of
-    raising, so a single malformed item doesn't discard the whole batch.
-    """
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
-    content = content.strip()
-
-    def _try_parse(raw: str) -> list[dict]:
-        parsed = json.loads(raw)
-        # LLM occasionally wraps the array in an object key
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    parsed = v
-                    break
-        return parsed  # type: ignore[return-value]
-
-    parsed: list[dict] | None = None
-    try:
-        parsed = _try_parse(content)
-    except json.JSONDecodeError:
-        pass
-
-    if parsed is None:
-        # C: common LLM format error fixes
-        # 1. trailing comma: [...,]
-        content = re.sub(r",\s*([}\]])", r"\1", content)
-        # 2. single quotes → double quotes
-        content = content.replace("'", '"')
-        # 3. try to extract the first [...] block
-        match = re.search(r"\[.*\]", content, re.DOTALL)
-        if match:
-            try:
-                parsed = _try_parse(match.group())
-            except json.JSONDecodeError:
-                pass
-
-    if parsed is None:
-        raise json.JSONDecodeError("LLM response cannot be parsed as JSON", content, 0)
-
-    if item_schema is None:
-        return parsed
-
-    valid: list[dict] = []
-    for i, item in enumerate(parsed):
-        try:
-            jsonschema.validate(instance=item, schema=item_schema)
-            valid.append(item)
-        except jsonschema.ValidationError as exc:
-            logger.warning(f"  item[{i}] schema validation failed — skipped: {exc.message}")
-    return valid
-
-
 def _llm_classify_level1(
-    client: ZhipuAI,
+    client: OpenAI,
     titles: list[str],
-    config: dict[str, Any],
+    config: LabelingConfig,
     batch_idx: int = 0,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[dict], LLMUsage]:
     t0 = time.time()
-    _retry = config.get("llm_retry", _labeling_cfg().llm_retry)
+    _retry = config.llm_retry
     logger.info(f"LLM level-1 request batch={batch_idx}: {len(titles)} titles")
     for i, t in enumerate(titles):
         logger.debug(f"  sample {i + 1}: {t}")
+
     try:
         system_prompt = _load_level1_prompt(all_major_categories)
         titles_str = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
@@ -378,56 +351,45 @@ def _llm_classify_level1(
                 logger.warning(f"  level-1 retry {attempt}/{_retry} after empty/parse failure")
                 time.sleep(1.0 * attempt)
             try:
-                _create_kwargs: dict = {
-                    "model": config["model"],
-                    "messages": [
+                response = client.beta.chat.completions.parse(
+                    model=config.model,
+                    messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content},
                     ],
-                    "temperature": config["temperature"],
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": config["max_tokens"],
-                }
-                if config.get("seed") is not None:
-                    _create_kwargs["seed"] = config["seed"]
-                response = client.chat.completions.create(**_create_kwargs)
+                    max_tokens=config.max_tokens,
+                    response_format=Level1AnalysisResult,
+                    temperature=config.temperature,
+                    seed=config.seed,
+                    extra_body={"reasoning_split": True},
+                )
+
                 elapsed = time.time() - t0
-                usage = _extract_usage(response)
-                usage["_elapsed"] = elapsed
-                finish_reason = getattr(response.choices[0], "finish_reason", "unknown")  # type: ignore[union-attr]
-                content = (response.choices[0].message.content or "").strip()  # type: ignore[union-attr]
-                logger.info(
-                    f"  level-1 response attempt={attempt + 1} finish={finish_reason} content_len={len(content)}"
-                )
+                usage = LLMUsage.from_response(response, elapsed)
+                parsed_result = response.choices[0].message.parsed
+                logger.info(f"  level-1 response attempt={attempt + 1} parsed={parsed_result is not None}")
 
-                if not content:
+                if parsed_result is None:
                     last_err = LLMParseError(
-                        f"LLM returned empty response (finish_reason={finish_reason})",
+                        "LLM returned empty response",
                         titles=titles,
-                        raw_content="",
+                        raw_content=response.choices[0].message.content or "",
                         raw_request=user_content,
                     )
-                    logger.warning(f"  level-1 empty response (finish={finish_reason}), attempt={attempt + 1}")
+                    logger.warning(f"  level-1 empty response attempt={attempt + 1}")
                     continue
                 logger.info(
-                    f"  level-1 done — {elapsed:.2f}s  tokens={usage['total_tokens']}"
-                    f" cached={usage['cached_tokens']} finish={finish_reason}"
+                    f"  level-1 done — {elapsed:.2f}s  tokens={usage.total_tokens} cached={usage.cached_tokens}"
                 )
 
-                try:
-                    return _parse_llm_json(content, item_schema=_LEVEL1_ITEM_SCHEMA), usage
-                except (json.JSONDecodeError, Exception) as parse_err:
-                    last_err = LLMParseError(
-                        str(parse_err),
-                        titles=titles,
-                        raw_content=content,
-                        raw_request=user_content,
-                    )
-                    logger.warning(f"  level-1 parse failed attempt={attempt + 1}: {parse_err}")
-                    continue
+                return [item.model_dump() for item in parsed_result.items], usage
             except LLMParseError:
                 raise
             except Exception as e:
+                err_str = str(e)
+                if "1113" in err_str:
+                    logger.error(f"  level-1 insufficient balance — terminating pipeline: {e}")
+                    raise InsufficientBalanceError(err_str) from e
                 last_err = e
                 logger.warning(f"  level-1 API error attempt={attempt + 1}: {e}")
                 continue
@@ -441,7 +403,7 @@ def _llm_classify_level1(
             raw_content="",
             raw_request=user_content,
         )
-    except LLMParseError:
+    except (LLMParseError, InsufficientBalanceError):
         raise
     except Exception as e:
         logger.error(f"LLM level-1 request failed: {e}")
@@ -449,15 +411,15 @@ def _llm_classify_level1(
 
 
 def _llm_classify_level2(
-    client: ZhipuAI,
+    client: OpenAI,
     titles: list[str],
     major: str,
-    config: dict[str, Any],
+    config: LabelingConfig,
     contents: list[str | None] | None = None,
     batch_idx: int = 0,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[dict], LLMUsage]:
     t0 = time.time()
-    _retry = config.get("llm_retry", _labeling_cfg().llm_retry)
+    _retry = config.llm_retry
     item_count = len(titles)
     content_count = sum(1 for c in contents if c) if contents else 0
     logger.info(f"LLM level-2 request batch={batch_idx} [{major}]: {item_count} items ({content_count} with content)")
@@ -485,61 +447,46 @@ def _llm_classify_level2(
                 logger.warning(f"  level-2 [{major}] retry {attempt}/{_retry} after empty/parse failure")
                 time.sleep(1.0 * attempt)
             try:
-                _create_kwargs: dict = {
-                    "model": config["model"],
-                    "messages": [
+                response = client.beta.chat.completions.parse(
+                    model=config.model,
+                    messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content},
                     ],
-                    "temperature": config["temperature"],
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": config["max_tokens"],
-                }
-                if config.get("seed") is not None:
-                    _create_kwargs["seed"] = config["seed"]
-                response = client.chat.completions.create(**_create_kwargs)
+                    max_tokens=config.max_tokens,
+                    response_format=Level2AnalysisResult,
+                    temperature=config.temperature,
+                    seed=config.seed,
+                    extra_body={"reasoning_split": True},
+                )
+
                 elapsed = time.time() - t0
-                usage = _extract_usage(response)
-                usage["_elapsed"] = elapsed
-                finish_reason = getattr(response.choices[0], "finish_reason", "unknown")  # type: ignore[union-attr]
-                content = (response.choices[0].message.content or "").strip()  # type: ignore
-                logger.info(
-                    f"  level-2 [{major}] response attempt={attempt + 1}"
-                    f" finish={finish_reason} content_len={len(content)}"
-                )
+                usage = LLMUsage.from_response(response, elapsed)
+                parsed_result = response.choices[0].message.parsed  # type: ignore[union-attr]
+                logger.info(f"  level-2 [{major}] response attempt={attempt + 1} parsed={parsed_result is not None}")
 
-                if not content:
+                if parsed_result is None:
                     last_err = LLMParseError(
-                        f"LLM returned empty response (finish_reason={finish_reason})",
+                        "LLM returned empty response",
                         titles=titles,
-                        raw_content="",
+                        raw_content=response.choices[0].message.content or "",  # type: ignore[union-attr]
                         contents=contents,
                         raw_request=user_content,
                     )
-                    logger.warning(
-                        f"  level-2 [{major}] empty response (finish={finish_reason}), attempt={attempt + 1}"
-                    )
+                    logger.warning(f"  level-2 [{major}] empty response attempt={attempt + 1}")
                     continue
                 logger.info(
-                    f"  level-2 [{major}] done — {elapsed:.2f}s  tokens={usage['total_tokens']}"
-                    f" cached={usage['cached_tokens']} finish={finish_reason}"
+                    f"  level-2 [{major}] done — {elapsed:.2f}s  tokens={usage.total_tokens}"
+                    f" cached={usage.cached_tokens}"
                 )
-
-                try:
-                    return _parse_llm_json(content, item_schema=_LEVEL2_ITEM_SCHEMA), usage
-                except (json.JSONDecodeError, Exception) as parse_err:
-                    last_err = LLMParseError(
-                        str(parse_err),
-                        titles=titles,
-                        raw_content=content,
-                        contents=contents,
-                        raw_request=user_content,
-                    )
-                    logger.warning(f"  level-2 [{major}] parse failed attempt={attempt + 1}: {parse_err}")
-                    continue
+                return [item.model_dump() for item in parsed_result.items], usage
             except LLMParseError:
                 raise
             except Exception as e:
+                err_str = str(e)
+                if "1113" in err_str:
+                    logger.error(f"  level-2 [{major}] insufficient balance — terminating pipeline: {e}")
+                    raise InsufficientBalanceError(err_str) from e
                 last_err = e
                 logger.warning(f"  level-2 [{major}] API error attempt={attempt + 1}: {e}")
                 continue
@@ -576,10 +523,10 @@ def _group_by_major(items: list[dict]) -> dict[str, list[dict]]:
 
 def run_level1(
     con: duckdb.DuckDBPyConnection,
-    client: ZhipuAI,
+    client: OpenAI,
     sample_size: int,
     *,
-    config: dict[str, Any],
+    config: Level1Config,
     store: DuckDBStore,
     run_id: str | None = None,
     task_id: str | None = None,
@@ -591,10 +538,13 @@ def run_level1(
     current_task_id = task_id or "unknown"
     console.print(f"  Task ID: [cyan]{current_task_id[:12]}...[/cyan]")
 
-    # Sample from news_raw; seed makes the sample deterministic across ablation runs
-    df = store.sample_news(con, sample_size, seed=seed)
+    # Sample from news_raw; seed makes the sample deterministic across ablation runs.
+    # start (offset) allows continuation tasks to resume after a partial run.
+    start = config.start
+    df = store.sample_news(con, sample_size, seed=seed, offset=start)
     seed_note = f" seed={seed}" if seed is not None else ""
-    console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}")
+    start_note = f" start={start}" if start else ""
+    console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}{start_note}")
 
     keyword_results: list[dict] = []
     llm_pending: list[dict] = []
@@ -647,10 +597,10 @@ def run_level1(
 
     # Phase 2: LLM fallback
     llm_batch_results: list[dict] = []
-    _bs1 = config.get("batch_size_l1", _labeling_cfg().batch_size_l1)
-    total_batches = -(-len(llm_pending) // _bs1)
+    total_batches = -(-len(llm_pending) // config.batch_size)
     batch_count = 0
     llm_usage = LLMUsage()
+
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -659,12 +609,12 @@ def run_level1(
         console=console,
     ) as progress:
         task = progress.add_task("LLM fallback...", total=total_batches)
-        for i in range(0, len(llm_pending), _bs1):
-            batch = llm_pending[i : i + _bs1]
+        for i in range(0, len(llm_pending), config.batch_size):
+            batch = llm_pending[i : i + config.batch_size]
             try:
                 titles = [r["title"] for r in batch]
                 results, usage = _llm_classify_level1(client, titles, config, batch_idx=batch_count)
-                llm_usage.add(usage, usage.get("_elapsed", 0))
+                llm_usage.add(usage)
                 for j, r in enumerate(results):
                     if j < len(batch):
                         major = r.get("major", "")
@@ -686,17 +636,18 @@ def run_level1(
                     task_id=current_task_id,
                     major=None,
                     batch_idx=batch_count,
-                    model=config["model"],
+                    model=config.model,
                 )
                 progress.console.print(f"  [red]✗ batch {batch_count} parse failed (dumped to S3): {e}[/red]")
+            except InsufficientBalanceError:
+                raise
             except Exception as e:
                 progress.console.print(f"  [red]✗ batch failed: {e}[/red]")
             batch_count += 1
             progress.advance(task)
 
             # Checkpoint every N batches
-            _ckpt = config.get("checkpoint_every", _labeling_cfg().checkpoint_every)
-            if batch_count % _ckpt == 0 and llm_batch_results:
+            if batch_count % config.checkpoint_every == 0 and llm_batch_results:
                 total_saved += _flush_checkpoint(
                     con,
                     llm_batch_results,
@@ -708,7 +659,7 @@ def run_level1(
                 )
                 llm_batch_results = []
 
-            if i + _bs1 < len(llm_pending):
+            if i + config.batch_size < len(llm_pending):
                 time.sleep(0.5)
 
     # Flush remaining
@@ -739,7 +690,7 @@ def run_level1(
         mismatches = 0
         try:
             llm_results_verify, _verify_usage = _llm_classify_level1(client, verify_titles, config)
-            llm_usage.add(_verify_usage, _verify_usage.get("_elapsed", 0))
+            llm_usage.add(_verify_usage)
             for i, r in enumerate(llm_results_verify):
                 if i < len(verify_sample):
                     llm_major = r.get("major", "")
@@ -766,10 +717,10 @@ def run_level1(
 
 def run_level2(
     con: duckdb.DuckDBPyConnection,
-    client: ZhipuAI,
+    client: OpenAI,
     sample_size: int,
     *,
-    config: dict[str, Any],
+    config: Level2Config,
     store: DuckDBStore,
     run_id: str | None = None,
     task_id: str | None = None,
@@ -846,7 +797,7 @@ def run_level2(
     total_saved = 0
     llm_usage = LLMUsage()
     for major, pending in llm_pending_by_major.items():
-        total_batches = -(-len(pending) // config.get("batch_size_l2", _labeling_cfg().batch_size_l2))
+        total_batches = -(-len(pending) // config.batch_size)
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -855,9 +806,8 @@ def run_level2(
             console=console,
         ) as progress:
             task = progress.add_task(f"LLM [{major}]", total=total_batches)
-            _bs2 = config.get("batch_size_l2", _labeling_cfg().batch_size_l2)
-            for i in range(0, len(pending), _bs2):
-                batch = pending[i : i + _bs2]
+            for i in range(0, len(pending), config.batch_size):
+                batch = pending[i : i + config.batch_size]
                 try:
                     titles = [r["title"] for r in batch]
                     batch_contents = [r.get("content") for r in batch]
@@ -869,7 +819,7 @@ def run_level2(
                         contents=batch_contents,
                         batch_idx=batch_count,
                     )
-                    llm_usage.add(usage, usage.get("_elapsed", 0))
+                    llm_usage.add(usage)
                     for j, r in enumerate(results):
                         if j < len(batch):
                             news_id_str = str(batch[j]["news_id"])
@@ -907,26 +857,27 @@ def run_level2(
                         task_id=current_task_id,
                         major=major,
                         batch_idx=batch_count,
-                        model=config["model"],
+                        model=config.model,
                     )
                     progress.console.print(
                         f"  [red]✗ batch {batch_count} [{major}] parse failed (dumped to S3): {e}[/red]"
                     )
+                except InsufficientBalanceError:
+                    raise
                 except Exception as e:
                     progress.console.print(f"  [red]✗ batch failed: {e}[/red]")
                 batch_count += 1
                 progress.advance(task)
 
                 # Checkpoint every N batches
-                _ckpt = config.get("checkpoint_every", _labeling_cfg().checkpoint_every)
-                if batch_count % _ckpt == 0 and llm_batch_results:
+                if batch_count % config.checkpoint_every == 0 and llm_batch_results:
                     saved = store.save_sub_labels(con, llm_batch_results)
                     if checkpoint_fn:
                         checkpoint_fn(run_id, "level2-llm", batch_count, saved)
                     total_saved += saved
                     llm_batch_results = []
 
-                if i + _bs2 < len(pending):
+                if i + config.batch_size < len(pending):
                     time.sleep(0.5)
 
     # Flush remaining LLM results
@@ -955,7 +906,7 @@ def run_level2(
             try:
                 titles = [r["title"] for r in group]
                 llm_res, _v_usage = _llm_classify_level2(client, titles, major, config)
-                llm_usage.add(_v_usage, _v_usage.get("_elapsed", 0))
+                llm_usage.add(_v_usage)
                 for i, r in enumerate(llm_res):
                     if i < len(group):
                         if r.get("sub", "") != group[i]["sub_category"]:

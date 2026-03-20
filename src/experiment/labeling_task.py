@@ -6,13 +6,11 @@ and checkpoint management. Passes all dependencies into the pure
 business-logic functions in src.labeling.
 """
 
-import os
 import uuid
 from typing import Any
 
 import duckdb
 from loguru import logger
-from zhipuai import ZhipuAI
 
 from src.common import get_config
 from src.common.registry import TaskExecutor, TaskMetadata, TaskRegistry
@@ -20,7 +18,8 @@ from src.db import Task
 from src.db.models import TaskCheckpoint
 from src.db.store import DuckDBStore, duckdb_store
 from src.experiment.manager import ExperimentManager
-from src.labeling import run_level1, run_level2
+from src.labeling import Level1Config, Level2Config, run_level1, run_level2
+from src.utils.llm_client import get_llm_client
 from src.utils.loki_sink import LokiSink
 
 
@@ -149,17 +148,66 @@ class LabelingTaskExecutor(TaskExecutor):
                 "force_relabel",
                 "level1_task_id",
                 "seed",
+                "start",
                 "batch_size_l1",
                 "batch_size_l2",
                 "checkpoint_every",
+                "llm_retry",
+                "merge_source_task_ids",
             ],
         )
 
     def validate_params(self, params: dict[str, Any]) -> tuple[bool, str | None]:
+        # Merge task: combines results of multiple level-1 tasks, no LLM needed
+        if "merge_source_task_ids" in params:
+            source_ids = params["merge_source_task_ids"]
+            if not isinstance(source_ids, list) or len(source_ids) < 1:
+                return False, "merge_source_task_ids must be a non-empty list of task IDs"
+            root_cfg: dict | None = None
+            with ExperimentManager() as mgr:
+                for sid in source_ids:
+                    try:
+                        src_uuid = uuid.UUID(str(sid))
+                    except ValueError:
+                        return False, f"Invalid UUID in merge_source_task_ids: {sid}"
+                    src_task = mgr.get_task(src_uuid)
+                    if src_task is None:
+                        return False, f"Source task not found: {sid}"
+                    if src_task.task_type != "labeling":
+                        return False, f"Source task {sid} is not a labeling task"
+                    src_cfg = src_task.config or {}
+                    if src_cfg.get("level", 1) != 1:
+                        return False, f"Source task {sid} is not a level-1 task"
+                    compat_keys = ["model", "temperature"]
+                    if root_cfg is None:
+                        root_cfg = {k: src_cfg.get(k) for k in compat_keys}
+                    else:
+                        for k in compat_keys:
+                            if src_cfg.get(k) != root_cfg[k]:
+                                return False, (
+                                    f"Source task {sid} has incompatible config: "
+                                    f"{k}={src_cfg.get(k)!r} vs expected {root_cfg[k]!r}"
+                                )
+            return True, None
+
         if "model" not in params:
             return False, "Missing required param: model"
         if "temperature" not in params:
             return False, "Missing required param: temperature"
+
+        # Verify the model is in the registry and its API key is configured
+        from src.utils.llm_client import resolve_provider
+
+        model = params["model"]
+        try:
+            provider = resolve_provider(model)
+        except ValueError as e:
+            return False, str(e)
+
+        import os
+
+        if not os.environ.get(provider.key_env):
+            return False, (f"Model '{model}' requires env var {provider.key_env} to be set")
 
         level = params.get("level", 1)
         if level not in [1, 2]:
@@ -211,22 +259,31 @@ class LabelingTaskExecutor(TaskExecutor):
         level = cfg.get("level", 1)
         sample_size = cfg.get("sample_size", 10000)
         labeling_defaults = get_config().labeling
-        config = {
-            "model": cfg.get("model", "glm-4.5-airx" if level == 1 else "glm-4.7-flashx"),
-            "temperature": cfg.get("temperature", 0.1),
-            "max_tokens": cfg.get("max_tokens", 8192),
-            "batch_size_l1": cfg.get("batch_size_l1", labeling_defaults.batch_size_l1),
-            "batch_size_l2": cfg.get("batch_size_l2", labeling_defaults.batch_size_l2),
-            "checkpoint_every": cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
-            "llm_retry": cfg.get("llm_retry", labeling_defaults.llm_retry),
-            "seed": cfg.get("seed", None),
-        }
+        _common = dict(
+            model=cfg.get("model", "glm-4-flash"),
+            temperature=cfg.get("temperature", 0.1),
+            max_tokens=cfg.get("max_tokens"),
+            checkpoint_every=cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
+            llm_retry=cfg.get("llm_retry", labeling_defaults.llm_retry),
+            seed=cfg.get("seed"),
+        )
+        if level == 1:
+            config = Level1Config(
+                **_common,
+                start=cfg.get("start", 0),
+                batch_size=cfg.get("batch_size_l1", labeling_defaults.batch_size_l1),
+            )
+        else:
+            config = Level2Config(
+                **_common,
+                batch_size=cfg.get("batch_size_l2", labeling_defaults.batch_size_l2),
+            )
 
-        api_key = os.environ.get("ZHIPU_API_KEY")
-        if not api_key:
-            return {"status": "error", "message": "ZHIPU_API_KEY not set", "total_labeled": 0}
+        try:
+            client = get_llm_client(config.model)
+        except ValueError as e:
+            return {"status": "error", "message": str(e), "total_labeled": 0}
 
-        client = ZhipuAI(api_key=api_key)
         task_uuid_str = str(task.task_id)
 
         # Set up infrastructure
@@ -238,7 +295,33 @@ class LabelingTaskExecutor(TaskExecutor):
 
         con = duckdb.connect(str(self.store.db_path))
         try:
+            # ── Merge task path: combine multiple level-1 tasks, no LLM ──────
+            merge_source_ids = cfg.get("merge_source_task_ids")
+            if merge_source_ids:
+                from src.common import console
+
+                source_ids = [str(sid) for sid in merge_source_ids]
+                console.print(
+                    f"\n[bold]Merging {len(source_ids)} level-1 tasks → Task ID {task_uuid_str[:12]}...[/bold]"
+                )
+                for sid in source_ids:
+                    console.print(f"  • [cyan]{sid}[/cyan]")
+                merged_count = self.store.merge_classified(con, source_ids, task_uuid_str)
+                console.print(
+                    f"[bold green]✓ Merge done[/bold green] — [bold]{merged_count}[/bold] labels in merged task"
+                )
+                summary = _build_summary(con, task_uuid_str, 1)
+                return {
+                    "status": "success",
+                    "message": f"Merged {merged_count} labels from {len(source_ids)} tasks",
+                    "total_labeled": merged_count,
+                    "level": 1,
+                    "merge_source_task_ids": source_ids,
+                    **summary,
+                }
+
             if level == 1:
+                assert isinstance(config, Level1Config)
                 run_level1(
                     con,
                     client,
@@ -251,6 +334,7 @@ class LabelingTaskExecutor(TaskExecutor):
                     checkpoint_fn=checkpoint_fn,
                 )
             else:
+                assert isinstance(config, Level2Config)
                 level1_task_id_str = cfg.get("level1_task_id", "")
                 with ExperimentManager() as mgr:
                     level1_task = mgr.get_task(uuid.UUID(level1_task_id_str))
@@ -292,15 +376,8 @@ class LabelingTaskExecutor(TaskExecutor):
                 "total_labeled": total,
                 "level": level,
                 "run_params": {
-                    "model": config["model"],
-                    "temperature": config["temperature"],
-                    "max_tokens": config["max_tokens"],
+                    **config.model_dump(),
                     "sample_size": sample_size,
-                    "seed": seed,
-                    "batch_size_l1": config["batch_size_l1"],
-                    "batch_size_l2": config["batch_size_l2"],
-                    "checkpoint_every": config["checkpoint_every"],
-                    "llm_retry": config["llm_retry"],
                     "s3_bucket": get_config().labeling.s3_bucket,
                 },
                 **summary,
