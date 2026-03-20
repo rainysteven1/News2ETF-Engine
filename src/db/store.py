@@ -57,13 +57,27 @@ class DuckDBStore:
                     news_id        VARCHAR,
                     title          VARCHAR,
                     major_category VARCHAR,
-                    sub_category   VARCHAR,
-                    sentiment      VARCHAR,
                     confidence     FLOAT,
                     label_source   VARCHAR,
                     task_id        VARCHAR,
                     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (news_id, task_id)
+                )
+            """)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS news_sub_classified (
+                    news_id          VARCHAR,
+                    title            VARCHAR,
+                    datetime         VARCHAR,
+                    major_category   VARCHAR,
+                    sub_category     VARCHAR,
+                    sentiment        VARCHAR,
+                    confidence       FLOAT,
+                    label_source     VARCHAR,
+                    level1_task_id   VARCHAR,
+                    level2_task_id   VARCHAR,
+                    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (news_id, level1_task_id, level2_task_id)
                 )
             """)
         finally:
@@ -134,36 +148,69 @@ class DuckDBStore:
         """).pl()
 
     def save_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict]) -> int:
-        """Insert new label rows; silently skip duplicates."""
+        """Insert level-1 label rows into news_classified; silently skip duplicates."""
+        if not labels:
+            return 0
+        df = pl.DataFrame(
+            [
+                {
+                    "news_id": r["news_id"],
+                    "title": r["title"],
+                    "major_category": r["major_category"],
+                    "confidence": r["confidence"],
+                    "label_source": r["label_source"],
+                    "task_id": r["task_id"],
+                }
+                for r in labels
+            ]
+        )  # noqa: F841
+        con.execute("""
+            INSERT OR IGNORE INTO news_classified
+                (news_id, title, major_category, confidence, label_source, task_id)
+            SELECT news_id, title, major_category, confidence, label_source, task_id
+            FROM df
+        """)
+        con.commit()
+        return len(labels)
+
+    def save_sub_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict]) -> int:
+        """Insert level-2 label rows into news_sub_classified; silently skip duplicates."""
         if not labels:
             return 0
         df = pl.DataFrame(labels)  # noqa: F841
         con.execute("""
-            INSERT OR IGNORE INTO news_classified
-                (news_id, title, major_category, sub_category, sentiment, confidence, label_source, task_id)
-            SELECT news_id, title, major_category, sub_category, sentiment, confidence, label_source, task_id
+            INSERT OR IGNORE INTO news_sub_classified
+                (news_id, title, datetime, major_category, sub_category, sentiment,
+                 confidence, label_source, level1_task_id, level2_task_id)
+            SELECT news_id, title, datetime, major_category, sub_category, sentiment,
+                   confidence, label_source, level1_task_id, level2_task_id
             FROM df
         """)
+        con.commit()
         return len(labels)
 
-    def batch_update_labels(self, con: duckdb.DuckDBPyConnection, updates: list[dict]) -> int:
-        """Bulk UPDATE via temp table + JOIN instead of per-row UPDATE."""
-        if not updates:
-            return 0
-        df = pl.DataFrame(updates)  # noqa: F841
-        con.execute("CREATE OR REPLACE TEMPORARY TABLE _label_updates AS SELECT * FROM df")
-        con.execute("""
-            UPDATE news_classified
-            SET sub_category = u.sub_category,
-                sentiment    = u.sentiment,
-                confidence   = u.confidence,
-                label_source = u.label_source
-            FROM _label_updates u
-            WHERE news_classified.news_id = u.news_id
-              AND news_classified.task_id = u.task_id
-        """)
-        con.execute("DROP TABLE IF EXISTS _label_updates")
-        return len(updates)
+    def export_training_data(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        level2_task_id: str,
+        confidence_threshold: float = 0.8,
+    ) -> pl.DataFrame:
+        """Export high-confidence level-2 labels for FinBERT training.
+
+        Returns rows with confidence >= threshold, ordered by datetime.
+        Typical use: call after a level-2 task completes, then save to Parquet.
+        """
+        return con.execute(
+            """
+            SELECT news_id, title, datetime, major_category, sub_category,
+                   sentiment, confidence, label_source
+            FROM news_sub_classified
+            WHERE level2_task_id = ?
+              AND confidence >= ?
+            ORDER BY datetime, news_id
+            """,
+            [level2_task_id, confidence_threshold],
+        ).pl()
 
 
 # Global singleton instance

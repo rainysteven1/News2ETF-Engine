@@ -71,6 +71,58 @@ def _teardown_loki(sink: LokiSink | None, handler_id: int | None) -> None:
         logger.remove(handler_id)
 
 
+def _build_summary(con: duckdb.DuckDBPyConnection, task_uuid_str: str, level: int) -> dict:
+    """Query DuckDB and build a structured result summary for the task record."""
+    if level == 1:
+        rows = con.execute(
+            """
+            SELECT major_category, label_source, COUNT(*) AS cnt,
+                   ROUND(AVG(confidence), 3) AS avg_conf
+            FROM news_classified
+            WHERE task_id = ?
+            GROUP BY major_category, label_source
+            ORDER BY major_category, label_source
+            """,
+            [task_uuid_str],
+        ).fetchall()
+        by_source = {}
+        by_major = {}
+        for major, source, cnt, avg_conf in rows:
+            by_source[source] = by_source.get(source, 0) + cnt
+            by_major.setdefault(major or "unknown", {})[source] = {"count": cnt, "avg_confidence": avg_conf}
+        return {
+            "by_label_source": by_source,
+            "by_major_category": by_major,
+        }
+    else:
+        rows = con.execute(
+            """
+            SELECT major_category, sub_category, label_source,
+                   sentiment, COUNT(*) AS cnt,
+                   ROUND(AVG(confidence), 3) AS avg_conf
+            FROM news_sub_classified
+            WHERE level2_task_id = ?
+            GROUP BY major_category, sub_category, label_source, sentiment
+            ORDER BY major_category, sub_category
+            """,
+            [task_uuid_str],
+        ).fetchall()
+        by_source: dict = {}
+        by_sub: dict = {}
+        by_sentiment: dict = {}
+        for major, sub, source, sentiment, cnt, avg_conf in rows:
+            by_source[source] = by_source.get(source, 0) + cnt
+            key = f"{major} / {sub}"
+            by_sub.setdefault(key, {})[source] = {"count": cnt, "avg_confidence": avg_conf}
+            if sentiment:
+                by_sentiment[sentiment] = by_sentiment.get(sentiment, 0) + cnt
+        return {
+            "by_label_source": by_source,
+            "by_sub_category": by_sub,
+            "by_sentiment": by_sentiment,
+        }
+
+
 @TaskRegistry.register
 class LabelingTaskExecutor(TaskExecutor):
     """Labeling task executor for news classification.
@@ -89,8 +141,18 @@ class LabelingTaskExecutor(TaskExecutor):
         return TaskMetadata(
             name="labeling",
             description="News labeling task with hierarchical classification",
-            required_params=["model", "temperature", "max_tokens"],
-            optional_params=["level", "sample_size", "force_relabel"],
+            required_params=["model", "temperature"],
+            optional_params=[
+                "max_tokens",
+                "level",
+                "sample_size",
+                "force_relabel",
+                "level1_task_id",
+                "seed",
+                "batch_size_l1",
+                "batch_size_l2",
+                "checkpoint_every",
+            ],
         )
 
     def validate_params(self, params: dict[str, Any]) -> tuple[bool, str | None]:
@@ -98,12 +160,28 @@ class LabelingTaskExecutor(TaskExecutor):
             return False, "Missing required param: model"
         if "temperature" not in params:
             return False, "Missing required param: temperature"
-        if "max_tokens" not in params:
-            return False, "Missing required param: max_tokens"
 
         level = params.get("level", 1)
         if level not in [1, 2]:
             return False, f"Invalid level: {level}, must be 1 or 2"
+
+        if level == 2:
+            level1_task_id_str = params.get("level1_task_id")
+            if not level1_task_id_str:
+                return False, "level=2 requires 'level1_task_id'"
+            try:
+                level1_uuid = uuid.UUID(str(level1_task_id_str))
+            except ValueError:
+                return False, f"Invalid level1_task_id (not a valid UUID): {level1_task_id_str}"
+
+            with ExperimentManager() as mgr:
+                level1_task = mgr.get_task(level1_uuid)
+            if level1_task is None:
+                return False, f"level1_task_id not found: {level1_task_id_str}"
+            if level1_task.task_type != "labeling":
+                return False, f"Referenced task is not a labeling task: {level1_task_id_str}"
+            if (level1_task.config or {}).get("level", 1) != 1:
+                return False, f"Referenced task is not a level-1 task: {level1_task_id_str}"
 
         return True, None
 
@@ -132,10 +210,15 @@ class LabelingTaskExecutor(TaskExecutor):
 
         level = cfg.get("level", 1)
         sample_size = cfg.get("sample_size", 10000)
+        labeling_defaults = get_config().labeling
         config = {
             "model": cfg.get("model", "glm-4.5-airx" if level == 1 else "glm-4.7-flashx"),
             "temperature": cfg.get("temperature", 0.1),
             "max_tokens": cfg.get("max_tokens", 8192),
+            "batch_size_l1": cfg.get("batch_size_l1", labeling_defaults.batch_size_l1),
+            "batch_size_l2": cfg.get("batch_size_l2", labeling_defaults.batch_size_l2),
+            "checkpoint_every": cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
+            "seed": cfg.get("seed", None),
         }
 
         api_key = os.environ.get("ZHIPU_API_KEY")
@@ -154,26 +237,71 @@ class LabelingTaskExecutor(TaskExecutor):
 
         con = duckdb.connect(str(self.store.db_path))
         try:
-            fn = run_level1 if level == 1 else run_level2
-            fn(
-                con,
-                client,
-                sample_size,
-                config=config,
-                store=self.store,
-                run_id=run_id,
-                task_id=task_uuid_str,
-                seed=seed,
-                checkpoint_fn=checkpoint_fn,
-            )
+            if level == 1:
+                run_level1(
+                    con,
+                    client,
+                    sample_size,
+                    config=config,
+                    store=self.store,
+                    run_id=run_id,
+                    task_id=task_uuid_str,
+                    seed=seed,
+                    checkpoint_fn=checkpoint_fn,
+                )
+            else:
+                level1_task_id_str = cfg.get("level1_task_id", "")
+                with ExperimentManager() as mgr:
+                    level1_task = mgr.get_task(uuid.UUID(level1_task_id_str))
+                if level1_task is None:
+                    return {
+                        "status": "error",
+                        "message": f"level1_task_id not found: {level1_task_id_str}",
+                        "total_labeled": 0,
+                    }
+                if level1_task.experiment_id != task.experiment_id:
+                    return {
+                        "status": "error",
+                        "message": (f"level1_task_id {level1_task_id_str} does not belong to the same experiment"),
+                        "total_labeled": 0,
+                    }
+                run_level2(
+                    con,
+                    client,
+                    sample_size,
+                    config=config,
+                    store=self.store,
+                    run_id=run_id,
+                    task_id=task_uuid_str,
+                    level1_task_id=level1_task_id_str,
+                    seed=seed,
+                    checkpoint_fn=checkpoint_fn,
+                )
 
             total = con.execute("SELECT COUNT(*) FROM news_classified WHERE task_id = ?", [task_uuid_str]).fetchone()[0]  # type: ignore
+            if level == 2:
+                total = con.execute(
+                    "SELECT COUNT(*) FROM news_sub_classified WHERE level2_task_id = ?", [task_uuid_str]
+                ).fetchone()[0]  # type: ignore
 
+            summary = _build_summary(con, task_uuid_str, level)
             return {
                 "status": "success",
                 "message": f"Task completed: {total} labels created",
                 "total_labeled": total,
                 "level": level,
+                "run_params": {
+                    "model": config["model"],
+                    "temperature": config["temperature"],
+                    "max_tokens": config["max_tokens"],
+                    "sample_size": sample_size,
+                    "seed": seed,
+                    "batch_size_l1": config["batch_size_l1"],
+                    "batch_size_l2": config["batch_size_l2"],
+                    "checkpoint_every": config["checkpoint_every"],
+                    "s3_bucket": get_config().labeling.s3_bucket,
+                },
+                **summary,
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "total_labeled": 0}

@@ -42,9 +42,24 @@ class LokiConfig(BaseModel):
     url: str = "http://localhost:3100"
 
 
+class S3Config(BaseModel):
+    endpoint: str = "http://localhost:8333"
+    access_key: str = ""
+    secret_key: str = ""
+
+
+class LabelingConfig(BaseModel):
+    batch_size_l1: int = 20
+    batch_size_l2: int = 20
+    checkpoint_every: int = 5
+    s3_bucket: str = "labeling"
+
+
 class AppConfig(BaseModel):
     database: DatabaseConfig = DatabaseConfig()
     loki: LokiConfig = LokiConfig()
+    s3: S3Config = S3Config()
+    labeling: LabelingConfig = LabelingConfig()
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────
