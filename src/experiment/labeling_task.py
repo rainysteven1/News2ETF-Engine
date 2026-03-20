@@ -218,6 +218,7 @@ class LabelingTaskExecutor(TaskExecutor):
             "batch_size_l1": cfg.get("batch_size_l1", labeling_defaults.batch_size_l1),
             "batch_size_l2": cfg.get("batch_size_l2", labeling_defaults.batch_size_l2),
             "checkpoint_every": cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
+            "llm_retry": cfg.get("llm_retry", labeling_defaults.llm_retry),
             "seed": cfg.get("seed", None),
         }
 
@@ -299,6 +300,7 @@ class LabelingTaskExecutor(TaskExecutor):
                     "batch_size_l1": config["batch_size_l1"],
                     "batch_size_l2": config["batch_size_l2"],
                     "checkpoint_every": config["checkpoint_every"],
+                    "llm_retry": config["llm_retry"],
                     "s3_bucket": get_config().labeling.s3_bucket,
                 },
                 **summary,

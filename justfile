@@ -16,14 +16,7 @@ build:
 
 # Run production container
 run:
-    docker run --rm -d \
-        --user "$(id -u):$(id -g)" \
-        --env-file .env \
-        --network host \
-        --volume {{root}}/config.toml:/app/config.toml:ro \
-        --volume {{root}}/data:/app/data \
-        {{image}} \
-        python main.py
+    docker compose up -d --force-recreate app
 
 # Start local dev server with hot reload
 dev:

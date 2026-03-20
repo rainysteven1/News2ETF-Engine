@@ -91,4 +91,5 @@ exclude = [ #
     "output/",
     "**/node_modules",
     "**/.*",
+    "alembic/versions/",
 ]

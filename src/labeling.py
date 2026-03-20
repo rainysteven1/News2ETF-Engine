@@ -42,23 +42,6 @@ def _labeling_cfg():
     return get_config().labeling
 
 
-# Convenience accessors — read from config each call
-def _batch_l1() -> int:
-    return _labeling_cfg().batch_size_l1
-
-
-def _batch_l2() -> int:
-    return _labeling_cfg().batch_size_l2
-
-
-def _checkpoint_every() -> int:
-    return _labeling_cfg().checkpoint_every
-
-
-def _s3_bucket() -> str:
-    return _labeling_cfg().s3_bucket
-
-
 # ──────────────────────────────────────────────
 # LLM parse-error diagnostics
 # ──────────────────────────────────────────────
@@ -113,9 +96,9 @@ def _dump_llm_error(
         "raw_response": err.raw_content,
     }
     logger.error(
-        f"LLM parse error (level={level}, major={major}, batch={batch_idx}) — dumping to S3: s3://{_s3_bucket()}/{key}"
+        f"LLM parse error (level={level}, major={major}, batch={batch_idx}) — dumping to S3: s3://{_labeling_cfg().s3_bucket}/{key}"
     )
-    _s3_upload_json(_s3_bucket(), key, payload)
+    _s3_upload_json(_labeling_cfg().s3_bucket, key, payload)
 
 
 # ──────────────────────────────────────────────
@@ -377,10 +360,11 @@ def _llm_classify_level1(
     client: ZhipuAI,
     titles: list[str],
     config: dict[str, Any],
-    _retry: int = 2,
+    batch_idx: int = 0,
 ) -> tuple[list[dict], dict]:
     t0 = time.time()
-    logger.info(f"LLM level-1 request: {len(titles)} titles")
+    _retry = config.get("llm_retry", _labeling_cfg().llm_retry)
+    logger.info(f"LLM level-1 request batch={batch_idx}: {len(titles)} titles")
     for i, t in enumerate(titles):
         logger.debug(f"  sample {i + 1}: {t}")
     try:
@@ -470,12 +454,13 @@ def _llm_classify_level2(
     major: str,
     config: dict[str, Any],
     contents: list[str | None] | None = None,
-    _retry: int = 2,
+    batch_idx: int = 0,
 ) -> tuple[list[dict], dict]:
     t0 = time.time()
+    _retry = config.get("llm_retry", _labeling_cfg().llm_retry)
     item_count = len(titles)
     content_count = sum(1 for c in contents if c) if contents else 0
-    logger.info(f"LLM level-2 request [{major}]: {item_count} items ({content_count} with content)")
+    logger.info(f"LLM level-2 request batch={batch_idx} [{major}]: {item_count} items ({content_count} with content)")
     for i, t in enumerate(titles):
         logger.debug(f"  sample {i + 1}: {t}")
     try:
@@ -662,7 +647,7 @@ def run_level1(
 
     # Phase 2: LLM fallback
     llm_batch_results: list[dict] = []
-    _bs1 = config.get("batch_size_l1", _batch_l1())
+    _bs1 = config.get("batch_size_l1", _labeling_cfg().batch_size_l1)
     total_batches = -(-len(llm_pending) // _bs1)
     batch_count = 0
     llm_usage = LLMUsage()
@@ -678,7 +663,7 @@ def run_level1(
             batch = llm_pending[i : i + _bs1]
             try:
                 titles = [r["title"] for r in batch]
-                results, usage = _llm_classify_level1(client, titles, config)
+                results, usage = _llm_classify_level1(client, titles, config, batch_idx=batch_count)
                 llm_usage.add(usage, usage.get("_elapsed", 0))
                 for j, r in enumerate(results):
                     if j < len(batch):
@@ -710,7 +695,8 @@ def run_level1(
             progress.advance(task)
 
             # Checkpoint every N batches
-            if batch_count % config.get("checkpoint_every", _checkpoint_every()) == 0 and llm_batch_results:
+            _ckpt = config.get("checkpoint_every", _labeling_cfg().checkpoint_every)
+            if batch_count % _ckpt == 0 and llm_batch_results:
                 total_saved += _flush_checkpoint(
                     con,
                     llm_batch_results,
@@ -860,7 +846,7 @@ def run_level2(
     total_saved = 0
     llm_usage = LLMUsage()
     for major, pending in llm_pending_by_major.items():
-        total_batches = -(-len(pending) // config.get("batch_size_l2", _batch_l2()))
+        total_batches = -(-len(pending) // config.get("batch_size_l2", _labeling_cfg().batch_size_l2))
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -869,7 +855,7 @@ def run_level2(
             console=console,
         ) as progress:
             task = progress.add_task(f"LLM [{major}]", total=total_batches)
-            _bs2 = config.get("batch_size_l2", _batch_l2())
+            _bs2 = config.get("batch_size_l2", _labeling_cfg().batch_size_l2)
             for i in range(0, len(pending), _bs2):
                 batch = pending[i : i + _bs2]
                 try:
@@ -881,6 +867,7 @@ def run_level2(
                         major,
                         config,
                         contents=batch_contents,
+                        batch_idx=batch_count,
                     )
                     llm_usage.add(usage, usage.get("_elapsed", 0))
                     for j, r in enumerate(results):
@@ -931,7 +918,8 @@ def run_level2(
                 progress.advance(task)
 
                 # Checkpoint every N batches
-                if batch_count % config.get("checkpoint_every", _checkpoint_every()) == 0 and llm_batch_results:
+                _ckpt = config.get("checkpoint_every", _labeling_cfg().checkpoint_every)
+                if batch_count % _ckpt == 0 and llm_batch_results:
                     saved = store.save_sub_labels(con, llm_batch_results)
                     if checkpoint_fn:
                         checkpoint_fn(run_id, "level2-llm", batch_count, saved)

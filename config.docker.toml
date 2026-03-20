@@ -19,3 +19,4 @@ batch_size_l1 = 20
 batch_size_l2 = 20
 checkpoint_every = 5
 s3_bucket = "labeling"
+llm_retry = 2

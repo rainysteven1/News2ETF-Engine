@@ -53,6 +53,7 @@ class LabelingConfig(BaseModel):
     batch_size_l2: int = 20
     checkpoint_every: int = 5
     s3_bucket: str = "labeling"
+    llm_retry: int = 2
 
 
 class AppConfig(BaseModel):
