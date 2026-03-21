@@ -1,0 +1,55 @@
+# FinBERT hierarchical classifier configuration
+# All paths are relative to the project root (one level above this file)
+
+[model]
+# HuggingFace model name or local checkpoint path
+pretrained_model = "IDEA-CCNL/Erlangshen-FinBERT-base"
+max_seq_length = 128
+dropout = 0.1
+
+[hierarchy]
+num_level1 = 8    # number of level-1 major categories
+num_level2 = 28   # number of level-2 subcategories (global index)
+num_sentiment = 3 # negative(0) / neutral(1) / positive(2)
+
+[loss]
+alpha = 0.3 # L1 loss weight
+beta = 0.5  # L2 loss weight
+gamma = 0.2 # sentiment loss weight
+
+[training]
+batch_size = 64
+learning_rate = 2e-5
+weight_decay = 0.01
+warmup_ratio = 0.1
+num_epochs = 5
+grad_accum_steps = 1
+max_grad_norm = 1.0
+seed = 42
+fp16 = true
+
+[data]
+# Directory containing labeled parquet files with title / level1 / level2 / sentiment columns
+data_dir = "data/labeled"
+train_file = "train.parquet"
+val_file = "val.parquet"
+test_file = "test.parquet"
+
+[output]
+output_dir = "finbert/checkpoints"
+log_steps = 50
+eval_steps = 200
+save_steps = 500
+
+[inference]
+checkpoint_dir = "finbert/checkpoints/best"
+input_file = "data/converted/tushare_news_2021_today_part1.parquet"
+output_file = "data/classified.parquet"
+infer_batch_size = 256
+use_content = false
+
+[wandb]
+project = "news2etf-finbert"
+entity = ""                  # W&B team / username; leave empty for personal account
+mode = "offline"             # online | offline | disabled
+log_l2_cm = false            # log level-2 confusion matrix at end of training
