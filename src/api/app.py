@@ -15,7 +15,8 @@ from src.api.routers import data, experiments, industry, labeling, tasks
 from src.common.config import ROOT_DIR
 
 # Controlled by main.py CLI; default True so `uvicorn src.api.app:app` still migrates.
-RUN_MIGRATE: bool = True
+# Set RUN_MIGRATE=false via env var to skip migrations (e.g. for swagger export).
+RUN_MIGRATE: bool = os.getenv("RUN_MIGRATE", "true").lower() != "false"
 SYNC_APIFOX: bool = False
 
 

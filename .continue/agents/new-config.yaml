@@ -1,0 +1,21 @@
+# This is an example configuration file
+# To learn more, see the full config.yaml reference: https://docs.continue.dev/reference
+
+name: Example Config
+version: 1.0.0
+schema: v1
+
+# Define which models can be used
+# https://docs.continue.dev/customization/models
+models:
+- name: "IC科技 Claude Sonnet 4.6 1x"
+  provider: "openai"
+  model: "claude-sonnet-4.6"
+  apiBase: "https://ai.dyhao.xin/v1"
+  apiKey: "sk-cp-4b7dd240425e93957582b8d9298406ed7ae306c7dd9f2fd7502d3e260266ed81"
+  roles: [ "chat", "edit", "apply" ]
+
+# MCP Servers that Continue can access
+# https://docs.continue.dev/customization/mcp-tools
+mcpServers:
+- uses: anthropic/memory-mcp
