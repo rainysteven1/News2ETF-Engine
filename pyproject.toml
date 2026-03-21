@@ -32,9 +32,12 @@ platform = [
     "boto3>=1.35.0",
 ]
 dev = ["ruff>=0.15.5", "uv>=0.10.12"]
-finbert = [
-    "wandb>=0.25.0",
-    "transformers>=4.40.0",
+finbert = ["wandb>=0.25.0", "transformers>=4.40.0", "scikit-learn>=1.8.0"]
+agent = [
+    "openai>=2.29.0",
+    "langgraph>=0.2.0",
+    "lightgbm>=4.0.0",
+    "xgboost>=2.0.0",
     "scikit-learn>=1.8.0",
 ]
 torch_cpu = ["torch==2.1.0+cpu", "torchvision==0.16.0+cpu"]

@@ -46,7 +46,10 @@ db-history:
     uv run alembic history --verbose
 
 dev-sync:
-    uv sync --group platform --group dev --no-group finbert --no-group torch_cpu --no-group torch_gpu
+    uv sync --group platform --group dev --no-group finbert --no-group agent --no-group torch_cpu --no-group torch_gpu
 
 finbert-sync:
-    uv sync --group finbert --group dev --group torch_cpu --no-group platform --no-group torch_gpu
+    uv sync --group finbert --group dev --group torch_cpu --no-group agent  --no-group platform --no-group torch_gpu
+
+agent-sync:
+    uv sync --group agent --group dev --group torch_cpu --no-group platform --no-group finbert --no-group torch_gpu

@@ -1,0 +1,42 @@
+# Agent module configuration
+# All paths are relative to the project root (one level above the agent directory)
+
+[model]
+# LSTM
+lstm_sequence_length = 5
+lstm_hidden_size = 64
+lstm_num_layers = 2
+lstm_dropout = 0.2
+
+# Isolation Forest
+iforest_contamination = 0.1
+iforest_n_estimators = 100
+
+# LightGBM
+lgbm_num_leaves = 31
+lgbm_learning_rate = 0.05
+lgbm_n_estimators = 100
+
+[agent]
+llm_model = "glm-4-flash"
+llm_temperature = 0.0
+max_weight_per_industry = 0.3
+max_total_weight = 1.0
+
+[backtest]
+initial_capital = 1000000.0
+transaction_fee = 0.0003
+slippage = 0.0005
+risk_free_rate = 0.03
+
+[data]
+input_classified = "data/classified_sub.parquet"
+industry_dict = "data/industry_dict.json"
+etf_prices = "data/etf_prices.parquet"
+output_sentiment = "data/industry_sentiment.parquet"
+output_signals = "data/ml_signals.parquet"
+output_trades = "data/trade_signals.parquet"
+output_logs = "data/decision_logs.jsonl"
+output_backtest = "data/backtest_results.parquet"
+start_date = "2021-01-01"
+end_date = "2024-12-31"
