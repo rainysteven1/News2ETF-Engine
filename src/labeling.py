@@ -134,6 +134,10 @@ def _load_level2_prompt(major: str, subs: list[str]) -> str:
     return template.replace("{major}", major).replace("{subs}", subs_yaml)
 
 
+def _load_json_fixer_prompt() -> str:
+    return (CONFIGS_DIR / "prompts" / "label_json_fixer_system.md").read_text(encoding="utf-8").strip()
+
+
 # ──────────────────────────────────────────────
 # Hierarchy (loaded once per process)
 # ──────────────────────────────────────────────
@@ -196,16 +200,17 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
     try:
         data = json.loads(raw)
         return model_cls.model_validate(data)
-    except Exception as e:
-        logger.warning(f"   Direct JSON parse failed, trying fallbacks... Error: {e}")
+    except Exception:
+        pass
 
     # 2. List fallback
     try:
         lst = json.loads(raw)
         if isinstance(lst, list) and lst:
+            logger.info("  JSON parse: list fallback succeeded")
             return model_cls.model_validate(lst[0])
-    except Exception as e:
-        logger.warning(f"   List fallback parse failed, trying markdown extraction... Error: {e}")
+    except Exception:
+        pass
 
     # 3. Markdown code block extraction
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
@@ -213,17 +218,19 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
         json_str = match.group(1).strip()
         try:
             data = json.loads(json_str)
+            logger.info("  JSON parse: markdown extraction succeeded")
             return model_cls.model_validate(data)
-        except Exception as e:
-            logger.warning(f"   Markdown extraction failed... Error: {e}")
+        except Exception:
+            pass
 
         # List fallback (if markdown contains a list)
         try:
             lst = json.loads(json_str)
             if isinstance(lst, list) and lst:
+                logger.info("  JSON parse: markdown + list fallback succeeded")
                 return model_cls.model_validate(lst[0])
-        except Exception as e:
-            logger.warning(f"   List fallback failed... Error: {e}")
+        except Exception:
+            pass
 
     return None
 
@@ -480,6 +487,7 @@ def _llm_classify_level2(
 
     try:
         system_prompt = _load_level2_prompt(major, hierarchy[major])
+        json_fixer_prompt = _load_json_fixer_prompt()
         # Build user message: include content (truncated) when available
         parts: list[str] = []
         for i, t in enumerate(titles):
@@ -495,22 +503,38 @@ def _llm_classify_level2(
         user_content = "请分类以下新闻并判断情绪：\n" + "\n".join(parts)
 
         last_err: Exception | None = None
+        previous_raw_content: str = ""
+
         for attempt in range(1 + _retry):
             if attempt > 0:
                 logger.warning(f"  level-2 [{major}] retry {attempt}/{_retry} after empty/parse failure")
                 time.sleep(1.0 * attempt)
             try:
-                response = client.chat.completions.create(
-                    model=config.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    max_tokens=config.max_tokens,
-                    temperature=config.temperature,
-                    seed=config.seed,
-                    extra_body={"reasoning_split": True},
-                )
+                if attempt == 0:
+                    # Original classification request
+                    response = client.chat.completions.create(
+                        model=config.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content},
+                        ],
+                        max_tokens=config.max_tokens,
+                        temperature=config.temperature,
+                        seed=config.seed,
+                        extra_body={"reasoning_split": True},
+                    )
+                else:
+                    # JSON fixer request: use previous raw content as user prompt
+                    response = client.chat.completions.create(
+                        model=config.model,
+                        messages=[
+                            {"role": "system", "content": json_fixer_prompt},
+                            {"role": "user", "content": previous_raw_content},
+                        ],
+                        max_tokens=config.max_tokens,
+                        temperature=config.temperature,
+                        seed=config.seed,
+                    )
 
                 elapsed = time.time() - t0
                 usage = LLMUsage.from_response(response, elapsed)
@@ -527,6 +551,8 @@ def _llm_classify_level2(
                         raw_request=user_content,
                     )
                     logger.warning(f"  level-2 [{major}] empty response attempt={attempt + 1}")
+                    # Save raw content for fixer to use on next attempt
+                    previous_raw_content = raw_content
                     continue
                 logger.info(
                     f"  level-2 [{major}] done — {elapsed:.2f}s  tokens={usage.total_tokens}"
@@ -543,15 +569,23 @@ def _llm_classify_level2(
                     raise InsufficientBalanceError(err_str) from e
                 last_err = e
                 logger.warning(f"  level-2 [{major}] API error attempt={attempt + 1}: {e}")
+
+                # Save raw content for fixer to use on next attempt
+                previous_raw_content = raw_content if "raw_content" in dir() else ""  # type: ignore
                 continue
 
-        # All retries exhausted
+        # All retries exhausted - preserve previous_raw_content (fixer output) for S3 dump
+        final_raw_content = (
+            previous_raw_content
+            if previous_raw_content
+            else (last_err.raw_content if isinstance(last_err, LLMParseError) else "")
+        )
         if isinstance(last_err, LLMParseError):
             raise last_err
         raise LLMParseError(
             str(last_err),
             titles=titles,
-            raw_content="",
+            raw_content=final_raw_content,
             contents=contents,
             raw_request=user_content,
         )

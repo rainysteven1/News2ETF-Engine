@@ -13,10 +13,12 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen \
-        --no-group dev \
-        --no-group torch_cpu \
-        --no-group torch_gpu \
-        --no-install-project
+    --group platform \
+    --no-group dev \
+    --no-group finbert \
+    --no-group torch_cpu \
+    --no-group torch_gpu \
+    --no-install-project
 
 # ---------------------------------------------------------------------------
 # Stage 2 — minimal runtime (python-slim, no uv, no torch)
