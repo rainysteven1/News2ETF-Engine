@@ -6,21 +6,21 @@ and checkpoint management. Passes all dependencies into the pure
 business-logic functions in src.labeling.
 """
 
-import os
-import uuid
+from functools import cached_property
 from typing import Any
 
 import duckdb
 from loguru import logger
 
 from src.common import get_config
+from src.common.param_metadata import TaskParamSchema
 from src.common.registry import TaskExecutor, TaskMetadata, TaskRegistry
 from src.db import Task
 from src.db.models import TaskCheckpoint
 from src.db.store import DuckDBStore, duckdb_store
 from src.experiment.manager import ExperimentManager
 from src.labeling import Level1Config, Level2Config, run_level1, run_level2
-from src.utils.llm_client import get_llm_client, resolve_provider
+from src.utils.llm_client import get_llm_client
 from src.utils.loki_sink import LokiSink
 
 
@@ -133,79 +133,37 @@ class LabelingTaskExecutor(TaskExecutor):
       - Checkpoint handler (via ExperimentManager / PostgreSQL)
     """
 
+    task_type_name = "labeling"
+
     def __init__(self) -> None:
         self.store: DuckDBStore = duckdb_store
 
-    @property
+    @cached_property
     def metadata(self) -> TaskMetadata:
+        schema = TaskParamSchema.from_db("labeling")
         return TaskMetadata(
             name="labeling",
             description="News labeling task with hierarchical classification",
-            required_params=["model", "temperature"],
-            optional_params=[
-                "max_tokens",
-                "level",
-                "sample_size",
-                "force_relabel",
-                "level1_task_id",
-                "seed",
-                "start",
-                "batch_size_l1",
-                "batch_size_l2",
-                "checkpoint_every",
-                "llm_retry",
-            ],
+            required_params=schema.required_params,
+            optional_params=schema.optional_params,
+            param_schema=schema,
         )
 
     def validate_params(self, params: dict[str, Any]) -> tuple[bool, str | None]:
-        if "model" not in params:
-            return False, "Missing required param: model"
-        if "temperature" not in params:
-            return False, "Missing required param: temperature"
-
-        model = params["model"]
-        try:
-            provider = resolve_provider(model)
-        except ValueError as e:
-            return False, str(e)
-
-        if not os.environ.get(provider.key_env):
-            return False, (f"Model '{model}' requires env var {provider.key_env} to be set")
-
-        level = params.get("level", 1)
-        if level not in [1, 2]:
-            return False, f"Invalid level: {level}, must be 1 or 2"
-
-        if level == 2:
-            level1_task_id_str = params.get("level1_task_id")
-            if not level1_task_id_str:
-                return False, "level=2 requires 'level1_task_id'"
-            try:
-                level1_uuid = uuid.UUID(str(level1_task_id_str))
-            except ValueError:
-                return False, f"Invalid level1_task_id (not a valid UUID): {level1_task_id_str}"
-
-            with ExperimentManager() as mgr:
-                level1_task = mgr.get_task(level1_uuid)
-            if level1_task is None:
-                return False, f"level1_task_id not found: {level1_task_id_str}"
-            if level1_task.task_type != "labeling":
-                return False, f"Referenced task is not a labeling task: {level1_task_id_str}"
-            if (level1_task.config or {}).get("level", 1) != 1:
-                return False, f"Referenced task is not a level-1 task: {level1_task_id_str}"
-
-        return True, None
+        validator = self.metadata.param_validator
+        assert validator is not None, "Param schema should always have a validator function"
+        return validator.validate(params)
 
     # ── checkpoint callback ─────────────────────
 
-    def _make_checkpoint_fn(self, task_id: uuid.UUID):
+    def _make_checkpoint_fn(self, run_id: str):
         """Return a checkpoint callback that persists via ExperimentManager."""
         from src.experiment.manager import ExperimentManager
 
-        def _save(run_id: str | None, stage: str, batch_idx: int, saved_count: int) -> None:
+        def _save(loki_run_id: str | None, stage: str, batch_idx: int, saved_count: int) -> None:
             with ExperimentManager() as mgr:
                 mgr.save_checkpoint(
-                    task_id=task_id,
+                    run_id=run_id,
                     stage=stage,
                     batch_idx=batch_idx,
                     processed_count=saved_count,
@@ -220,7 +178,6 @@ class LabelingTaskExecutor(TaskExecutor):
         cfg = task.config or {}
 
         level = cfg.get("level", 1)
-        sample_size = cfg.get("sample_size", 10000)
         labeling_defaults = get_config().labeling
         _common = dict(
             model=cfg.get("model", "glm-4-flash"),
@@ -229,17 +186,19 @@ class LabelingTaskExecutor(TaskExecutor):
             checkpoint_every=cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
             llm_retry=cfg.get("llm_retry", labeling_defaults.llm_retry),
             seed=cfg.get("seed"),
+            batch_size=cfg.get("batch_size", labeling_defaults.batch_size),
+            sample_size=cfg.get("sample_size", None),
         )
+
         if level == 1:
             config = Level1Config(
                 **_common,
                 start=cfg.get("start", 0),
-                batch_size=cfg.get("batch_size_l1", labeling_defaults.batch_size_l1),
             )
         else:
             config = Level2Config(
                 **_common,
-                batch_size=cfg.get("batch_size_l2", labeling_defaults.batch_size_l2),
+                level1_task_id=cfg.get("level1_task_id", ""),
             )
 
         try:
@@ -252,7 +211,10 @@ class LabelingTaskExecutor(TaskExecutor):
         # Set up infrastructure
         self.store.init_db()
         loki_sink, loki_handler = _setup_loki(run_id, level_stage=f"level{level}")
-        checkpoint_fn = self._make_checkpoint_fn(task.task_id)
+
+        # run_id here is the 8-char string, used for both DuckDB records and checkpoint FK
+        assert run_id is not None, "run_id must be provided for labeling tasks"
+        checkpoint_fn = self._make_checkpoint_fn(run_id)
 
         seed = cfg.get("seed", None)
 
@@ -263,7 +225,6 @@ class LabelingTaskExecutor(TaskExecutor):
                 run_level1(
                     con,
                     client,
-                    sample_size,
                     config=config,
                     store=self.store,
                     run_id=run_id,
@@ -273,30 +234,13 @@ class LabelingTaskExecutor(TaskExecutor):
                 )
             else:
                 assert isinstance(config, Level2Config)
-                level1_task_id_str = cfg.get("level1_task_id", "")
-                with ExperimentManager() as mgr:
-                    level1_task = mgr.get_task(uuid.UUID(level1_task_id_str))
-                if level1_task is None:
-                    return {
-                        "status": "error",
-                        "message": f"level1_task_id not found: {level1_task_id_str}",
-                        "total_labeled": 0,
-                    }
-                if level1_task.experiment_id != task.experiment_id:
-                    return {
-                        "status": "error",
-                        "message": (f"level1_task_id {level1_task_id_str} does not belong to the same experiment"),
-                        "total_labeled": 0,
-                    }
                 run_level2(
                     con,
                     client,
-                    sample_size,
                     config=config,
                     store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
-                    level1_task_id=level1_task_id_str,
                     seed=seed,
                     checkpoint_fn=checkpoint_fn,
                 )
@@ -316,7 +260,6 @@ class LabelingTaskExecutor(TaskExecutor):
                 "run_id": run_id,
                 "run_params": {
                     **config.model_dump(),
-                    "sample_size": sample_size,
                     "s3_bucket": get_config().labeling.s3_bucket,
                 },
                 **summary,
@@ -328,8 +271,8 @@ class LabelingTaskExecutor(TaskExecutor):
             _teardown_loki(loki_sink, loki_handler)
 
     def get_checkpoint_handler(self):
-        def get_checkpoints(task_id: str | uuid.UUID) -> list[TaskCheckpoint]:
+        def get_checkpoints(run_id: str) -> list[TaskCheckpoint]:
             with ExperimentManager() as mgr:
-                return mgr.get_checkpoints(uuid.UUID(task_id) if isinstance(task_id, str) else task_id)
+                return mgr.get_checkpoints(run_id)
 
         return get_checkpoints

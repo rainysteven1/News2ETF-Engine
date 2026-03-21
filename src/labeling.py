@@ -215,19 +215,20 @@ class LabelingConfig(BaseModel):
     checkpoint_every: int
     llm_retry: int
     seed: int | None = None
+    batch_size: int
+    sample_size: int | None = None
 
 
 class Level1Config(LabelingConfig):
     """Config for level-1 major-category labeling."""
 
     start: int = 0
-    batch_size: int  # formerly batch_size_l1
 
 
 class Level2Config(LabelingConfig):
     """Config for level-2 sub-category + sentiment labeling."""
 
-    batch_size: int  # formerly batch_size_l2
+    level1_task_id: str
 
 
 # ──────────────────────────────────────────────
@@ -532,7 +533,6 @@ def _group_by_major(items: list[dict]) -> dict[str, list[dict]]:
 def run_level1(
     con: duckdb.DuckDBPyConnection,
     client: OpenAI,
-    sample_size: int,
     *,
     config: Level1Config,
     store: DuckDBStore,
@@ -541,7 +541,8 @@ def run_level1(
     seed: int | None = None,
     checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
-    console.print(f"\n[bold]Level-1 major-category labeling[/bold] (sample [cyan]{sample_size}[/cyan])")
+    assert config.sample_size is not None, "sample_size must be specified in config for level-1"
+    console.print(f"\n[bold]Level-1 major-category labeling[/bold] (sample [cyan]{config.sample_size}[/cyan])")
 
     current_task_id = task_id or "unknown"
     console.print(f"  Task ID: [cyan]{current_task_id[:12]}...[/cyan]")
@@ -549,7 +550,7 @@ def run_level1(
     # Sample from news_raw; seed makes the sample deterministic across ablation runs.
     # start (offset) allows continuation tasks to resume after a partial run.
     start = config.start
-    df = store.sample_news(con, sample_size, seed=seed, offset=start)
+    df = store.sample_news(con, config.sample_size, seed=seed, offset=start)
     seed_note = f" seed={seed}" if seed is not None else ""
     start_note = f" start={start}" if start else ""
     console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}{start_note}")
@@ -726,21 +727,24 @@ def run_level1(
 def run_level2(
     con: duckdb.DuckDBPyConnection,
     client: OpenAI,
-    sample_size: int,
     *,
     config: Level2Config,
     store: DuckDBStore,
     run_id: str | None = None,
     task_id: str | None = None,
-    level1_task_id: str | None = None,
     seed: int | None = None,
     checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
-    console.print(f"\n[bold]Level-2 sub-category + sentiment labeling[/bold] (sample [cyan]{sample_size}[/cyan])")
+    assert config.sample_size is not None, "sample_size must be specified in config for level-2"
+    console.print(
+        f"\n[bold]Level-2 sub-category + sentiment labeling[/bold] (sample [cyan]{config.sample_size}[/cyan])"
+    )
 
     current_task_id = task_id or "unknown"
     console.print(f"  Task ID: [cyan]{current_task_id[:12]}...[/cyan]")
-    source_task_id = level1_task_id or current_task_id
+
+    assert config.level1_task_id, "level1_task_id must be specified in config for level-2"
+    source_task_id = config.level1_task_id
     console.print(f"  Level-1 Task ID: [cyan]{source_task_id[:12]}...[/cyan]")
 
     # Fetch level-1 results from the specified level-1 task that haven't been
@@ -759,7 +763,7 @@ def run_level2(
                 AND sc.level2_task_id = ?
           )
         ORDER BY c.news_id
-        LIMIT {sample_size}
+        LIMIT {config.sample_size}
         """,
         [source_task_id, current_task_id],
     ).pl()

@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 
 from src.api.schemas import (
     CheckpointResponse,
+    RunResponse,
     SkippedTaskInfo,
     TaskBatchCreate,
     TaskBatchResponse,
@@ -58,34 +59,41 @@ def _find_task(mgr: ExperimentManager, task_id: str):
     raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
 
-def _execute_task(task_id: uuid.UUID, executor: Any) -> None:
-    with ExperimentManager() as mgr:
-        mgr.update_task_status(task_id, TaskStatus.RUNNING)
-    with ExperimentManager() as mgr:
-        task = mgr.get_task(task_id)
-        if task is None:
-            return
-    run_id = str(uuid.uuid4())[:8]
+def _execute_task(run_id: str, executor: Any) -> None:
+    """Execute a task run. Updates Run status, not Task status."""
     try:
-        result = executor.execute(task, run_id=run_id)
+        with ExperimentManager() as mgr:
+            run = mgr.get_run(run_id)
+            if run is None:
+                return
+            task = mgr.get_task(run.task_id)
+            if task is None:
+                return
+
+        result = executor.execute(task, run_id=run.run_id)
         final = TaskStatus.COMPLETED if result.get("status") == "success" else TaskStatus.FAILED
         err = None if final == TaskStatus.COMPLETED else result.get("message", "Unknown error")
         with ExperimentManager() as mgr:
-            mgr.update_task_status(task_id, final, result=result, error_msg=err)
+            mgr.update_run(run_id, final, result=result, error_msg=err)
     except Exception as exc:
         with ExperimentManager() as mgr:
-            mgr.update_task_status(task_id, TaskStatus.FAILED, error_msg=str(exc))
+            mgr.update_run(run_id, TaskStatus.FAILED, error_msg=str(exc))
 
 
 def _validate_config(task_type: str, cfg: dict[str, Any]) -> tuple[bool, str | None]:
     """Two-step validation:
     1. Check task type is registered.
     2. Delegate to the executor's own validate_params.
+
+    Raises HTTPException 400 on validation failure.
     """
     executor = TaskRegistry.get_executor(task_type)
     if executor is None:
-        return False, f"Unknown task type: '{task_type}'"
-    return executor.validate_params(cfg)
+        raise HTTPException(status_code=400, detail=f"Unknown task type: '{task_type}'")
+    ok, err_msg = executor.validate_params(cfg)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Validation failed: {err_msg}")
+    return True, None
 
 
 def _process_batch(body: TaskBatchCreate) -> TaskBatchResponse:
@@ -105,17 +113,8 @@ def _process_batch(body: TaskBatchCreate) -> TaskBatchResponse:
         for cfg in body.configs:
             config_hash = ExperimentManager.compute_config_hash(body.task_type, cfg)
 
-            # Step 1 — validate: first check task type, then call executor.validate_params
-            ok, err_msg = _validate_config(body.task_type, cfg)
-            if not ok:
-                warnings.append(
-                    SkippedTaskInfo(
-                        config=cfg,
-                        config_hash=config_hash,
-                        reason=f"Validation failed: {err_msg}",
-                    )
-                )
-                continue
+            # Step 1 — validate: raises HTTPException 400 on failure
+            _validate_config(body.task_type, cfg)
 
             # Step 2 — global dedup: skip if ANY completed task in the DB shares this config_hash
             existing = mgr.find_completed_by_hash(config_hash)
@@ -211,28 +210,11 @@ async def create_tasks_from_file(
 
 
 @router.get("", response_model=list[TaskResponse])
-def list_tasks(experiment: str | None = None, status: str | None = None) -> list[TaskResponse]:
+def list_tasks(experiment: str | None = None) -> list[TaskResponse]:
     with ExperimentManager() as mgr:
         experiment_id = _resolve_experiment_id(mgr, experiment) if experiment else None
-        try:
-            status_filter = TaskStatus(status) if status else None
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-        tasks = mgr.list_tasks(experiment_id=experiment_id, status=status_filter)
+        tasks = mgr.list_tasks(experiment_id=experiment_id)
         return [TaskResponse.model_validate(t) for t in tasks]
-
-
-@router.get("/run/{run_id}", response_model=TaskDetailResponse)
-def get_task_by_run_id(run_id: str) -> TaskDetailResponse:
-    """Look up a task by its run_id (returned in the result after execution)."""
-    with ExperimentManager() as mgr:
-        task = mgr.find_task_by_run_id(run_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"No task found with run_id: {run_id}")
-    checkpoints = mgr.get_checkpoints(task.task_id)
-    resp = TaskDetailResponse.model_validate(task)
-    resp.checkpoints = [CheckpointResponse.model_validate(cp) for cp in checkpoints]
-    return resp
 
 
 # ── Task types ────────────────────────────────────────────────────────────────
@@ -258,10 +240,17 @@ def list_task_types() -> list[TaskTypeInfo]:
 def get_task(task_id: str) -> TaskDetailResponse:
     with ExperimentManager() as mgr:
         task = _find_task(mgr, task_id)
-        checkpoints = mgr.get_checkpoints(task.task_id)
-        resp = TaskDetailResponse.model_validate(task)
-        resp.checkpoints = [CheckpointResponse.model_validate(cp) for cp in checkpoints]
-        return resp
+        runs = mgr.get_task_runs(task.task_id)
+        resp = TaskResponse.model_validate(task)
+        resp.runs = [RunResponse.model_validate(r) for r in runs]
+        # Build detail response with checkpoints from all runs
+        all_checkpoints = []
+        for run in runs:
+            checkpoints = mgr.get_checkpoints(run.run_id)
+            for cp in checkpoints:
+                cp_resp = CheckpointResponse.model_validate(cp)
+                all_checkpoints.append(cp_resp)
+        return TaskDetailResponse(**resp.model_dump(), checkpoints=all_checkpoints)
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -271,30 +260,64 @@ def get_task(task_id: str) -> TaskDetailResponse:
 def run_task(task_id: str, background_tasks: BackgroundTasks) -> TaskRunAccepted:
     with ExperimentManager() as mgr:
         task = _find_task(mgr, task_id)
-        tid, ttype, status = task.task_id, task.task_type, task.status
 
-    if status != TaskStatus.PENDING:
-        raise HTTPException(status_code=409, detail=f"Task status is '{status}', expected 'pending'")
-
-    executor = TaskRegistry.get_executor(ttype)
+    executor = TaskRegistry.get_executor(task.task_type)
     if executor is None:
-        raise HTTPException(status_code=400, detail=f"No executor for task type: {ttype}")
+        raise HTTPException(status_code=400, detail=f"No executor for task type: {task.task_type}")
 
-    background_tasks.add_task(_execute_task, tid, executor)
-    return TaskRunAccepted(task_id=str(tid))
-
-
-# ── Cancel ────────────────────────────────────────────────────────────────────
-
-
-@router.post("/{task_id}/cancel", response_model=TaskResponse)
-def cancel_task(task_id: str) -> TaskResponse:
     with ExperimentManager() as mgr:
-        task = _find_task(mgr, task_id)
-        if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
-            raise HTTPException(status_code=409, detail=f"Cannot cancel task with status '{task.status}'")
-        updated = mgr.update_task_status(task.task_id, TaskStatus.CANCELLED)
-        return TaskResponse.model_validate(updated)
+        run = mgr.create_run(task.task_id)
+
+    background_tasks.add_task(_execute_task, run.run_id, executor)
+    return TaskRunAccepted(task_id=str(task.task_id), run_id=run.run_id)
+
+
+# ── Run endpoints ─────────────────────────────────────────────────────────────
+
+
+@router.get("/runs/{run_id}", response_model=RunResponse)
+def get_run(run_id: str) -> RunResponse:
+    """Get a run by its 8-char run_id."""
+    with ExperimentManager() as mgr:
+        run = mgr.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    return RunResponse.model_validate(run)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=RunResponse)
+def cancel_run(run_id: str) -> RunResponse:
+    """Cancel a running run."""
+    with ExperimentManager() as mgr:
+        run = mgr.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        if run.status not in (TaskStatus.PENDING.value, TaskStatus.RUNNING.value):
+            raise HTTPException(status_code=409, detail=f"Cannot cancel run with status '{run.status}'")
+        updated = mgr.update_run(run_id, TaskStatus.CANCELLED)
+    return RunResponse.model_validate(updated)
+
+
+@router.post("/runs/{run_id}/restart", response_model=TaskRunAccepted, status_code=202)
+def restart_run(run_id: str, background_tasks: BackgroundTasks) -> TaskRunAccepted:
+    """Restart a run by creating a new run with the same task configuration."""
+    with ExperimentManager() as mgr:
+        old_run = mgr.get_run(run_id)
+        if old_run is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        task = mgr.get_task(old_run.task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task not found for run: {run_id}")
+
+    executor = TaskRegistry.get_executor(task.task_type)
+    if executor is None:
+        raise HTTPException(status_code=400, detail=f"No executor for task type: {task.task_type}")
+
+    with ExperimentManager() as mgr:
+        new_run = mgr.restart_run(run_id)
+
+    background_tasks.add_task(_execute_task, new_run.run_id, executor)
+    return TaskRunAccepted(task_id=str(task.task_id), run_id=new_run.run_id)
 
 
 # ── Export ─────────────────────────────────────────────────────────────────────

@@ -6,9 +6,15 @@ allowing new task types to be added without modifying core code.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from functools import cached_property
 from typing import Any
 
 from pydantic import BaseModel
+
+from src.common.param_metadata import TaskParamSchema
+from src.common.param_validator import ParamValidator
+from src.db.models import Task
 
 
 class TaskMetadata(BaseModel):
@@ -18,6 +24,17 @@ class TaskMetadata(BaseModel):
     description: str
     required_params: list[str] | None = None
     optional_params: list[str] | None = None
+    param_schema: TaskParamSchema | None = None
+
+    @property
+    def param_validator(self) -> ParamValidator | None:
+        """Build a ParamValidator from the embedded schema, if available."""
+        if self.param_schema is None:
+            return None
+        # Import here to avoid circular dependency at module load time
+        from src.common.param_validator import ParamValidator
+
+        return ParamValidator(self.param_schema)
 
 
 class TaskExecutor(ABC):
@@ -27,7 +44,10 @@ class TaskExecutor(ABC):
     using the @TaskRegistry.register decorator.
     """
 
-    @property
+    # Set this on each subclass so TaskRegistry.register can defer metadata access
+    task_type_name: str
+
+    @cached_property
     @abstractmethod
     def metadata(self) -> TaskMetadata:
         """Return task metadata."""
@@ -43,7 +63,7 @@ class TaskExecutor(ABC):
         pass
 
     @abstractmethod
-    def execute(self, task: "Task", run_id: str | None = None) -> dict[str, Any]:
+    def execute(self, task: Task, run_id: str | None = None) -> dict[str, Any]:
         """Execute the task.
 
         Args:
@@ -68,7 +88,7 @@ class TaskRegistry:
     """
 
     _executors: dict[str, type[TaskExecutor]] = {}
-    _metadata: dict[str, TaskMetadata] = {}
+    _metadata_factories: dict[str, Callable[[], TaskMetadata]] = {}
 
     @classmethod
     def register(cls, executor_cls: type[TaskExecutor]) -> type[TaskExecutor]:
@@ -80,9 +100,20 @@ class TaskRegistry:
                 ...
         """
         executor = executor_cls()
-        metadata = executor.metadata
-        cls._executors[metadata.name] = executor_cls
-        cls._metadata[metadata.name] = metadata
+        # Defer all executor.metadata access — it hits the DB and is not needed at import time.
+        # We need the name for registration; assume the executor declares it statically.
+        task_name = getattr(executor, "task_type_name", None)
+        if task_name is None:
+            raise AttributeError(
+                f"{executor_cls.__name__} must define `task_type_name: str` class attribute "
+                "for lazy registry registration"
+            )
+
+        def factory():
+            return executor.metadata
+
+        cls._executors[task_name] = executor_cls
+        cls._metadata_factories[task_name] = factory
         return executor_cls
 
     @classmethod
@@ -93,21 +124,22 @@ class TaskRegistry:
 
     @classmethod
     def get_metadata(cls, name: str) -> TaskMetadata | None:
-        """Get task metadata by name."""
-        return cls._metadata.get(name)
+        """Get task metadata by name (computed lazily on first access)."""
+        factory = cls._metadata_factories.get(name)
+        return factory() if factory else None
 
     @classmethod
     def list_all(cls) -> list[TaskMetadata]:
         """List all registered task types."""
-        return list(cls._metadata.values())
+        return [factory() for factory in cls._metadata_factories.values()]
 
     @classmethod
     def is_registered(cls, name: str) -> bool:
         """Check if a task type is registered."""
-        return name in cls._metadata
+        return name in cls._metadata_factories
 
     @classmethod
     def clear(cls) -> None:
         """Clear all registered tasks (useful for testing)."""
         cls._executors.clear()
-        cls._metadata.clear()
+        cls._metadata_factories.clear()

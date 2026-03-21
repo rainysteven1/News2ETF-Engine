@@ -36,10 +36,7 @@ dependencies = [
 
 [dependency-groups]
 platform = []
-dev = [
-    "ruff>=0.15.5",
-    "uv>=0.10.12",
-]
+dev = ["ruff>=0.15.5", "uv>=0.10.12"]
 torch_cpu = ["torch==2.1.0+cpu", "torchvision==0.16.0+cpu"]
 torch_gpu = ["torch==2.1.0", "torchvision==0.16.0"]
 
@@ -97,5 +94,5 @@ exclude = [ #
     "output/",
     "**/node_modules",
     "**/.*",
-    "alembic/versions/",
+    "alembic/versions/*_auto.py",
 ]

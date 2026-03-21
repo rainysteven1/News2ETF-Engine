@@ -31,12 +31,10 @@ class ExperimentResponse(BaseModel):
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
 
-class TaskResponse(BaseModel):
+class RunResponse(BaseModel):
+    run_id: str
     task_id: UUID
-    experiment_id: UUID | None
-    task_type: str
-    config: dict[str, Any]
-    config_hash: str
+    run_number: int
     status: str
     result: dict[str, Any] | None
     error_msg: str | None
@@ -47,8 +45,21 @@ class TaskResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TaskResponse(BaseModel):
+    task_id: UUID
+    experiment_id: UUID | None
+    task_type: str
+    config: dict[str, Any]
+    config_hash: str
+    created_at: datetime
+    runs: list[RunResponse] = []
+
+    model_config = {"from_attributes": True}
+
+
 class CheckpointResponse(BaseModel):
     id: int
+    run_id: str
     stage: str
     batch_idx: int
     processed_count: int
@@ -108,6 +119,7 @@ class TaskBatchResponse(BaseModel):
 class TaskRunAccepted(BaseModel):
     status: str = "accepted"
     task_id: str
+    run_id: str
 
 
 # ── Task types ────────────────────────────────────────────────────────────────

@@ -49,8 +49,7 @@ class S3Config(BaseModel):
 
 
 class LabelingConfig(BaseModel):
-    batch_size_l1: int = 20
-    batch_size_l2: int = 20
+    batch_size: int = 20
     checkpoint_every: int = 5
     s3_bucket: str = "labeling"
     llm_retry: int = 2
