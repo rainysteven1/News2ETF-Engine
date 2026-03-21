@@ -12,11 +12,14 @@ BackgroundTasks so the endpoint returns immediately with 202 Accepted.
 from __future__ import annotations
 
 import json
+import tempfile
 import tomllib
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from src.api.schemas import (
     CheckpointResponse,
@@ -219,6 +222,19 @@ def list_tasks(experiment: str | None = None, status: str | None = None) -> list
         return [TaskResponse.model_validate(t) for t in tasks]
 
 
+@router.get("/run/{run_id}", response_model=TaskDetailResponse)
+def get_task_by_run_id(run_id: str) -> TaskDetailResponse:
+    """Look up a task by its run_id (returned in the result after execution)."""
+    with ExperimentManager() as mgr:
+        task = mgr.find_task_by_run_id(run_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"No task found with run_id: {run_id}")
+    checkpoints = mgr.get_checkpoints(task.task_id)
+    resp = TaskDetailResponse.model_validate(task)
+    resp.checkpoints = [CheckpointResponse.model_validate(cp) for cp in checkpoints]
+    return resp
+
+
 # ── Task types ────────────────────────────────────────────────────────────────
 
 
@@ -279,3 +295,79 @@ def cancel_task(task_id: str) -> TaskResponse:
             raise HTTPException(status_code=409, detail=f"Cannot cancel task with status '{task.status}'")
         updated = mgr.update_task_status(task.task_id, TaskStatus.CANCELLED)
         return TaskResponse.model_validate(updated)
+
+
+# ── Export ─────────────────────────────────────────────────────────────────────
+
+
+@router.get("/{task_id}/export")
+def export_task_labels(task_id: str) -> StreamingResponse:
+    """Check task exists, then stream its classified records as a parquet file.
+
+    - level=1: exports from news_classified WHERE task_id = ?
+    - level=2: exports from news_sub_classified WHERE level2_task_id = ?
+    """
+    from src.db.store import duckdb_store
+
+    if not duckdb_store.db_path.exists():
+        raise HTTPException(status_code=503, detail="DuckDB not initialised.")
+
+    # 1. Verify task exists
+    with ExperimentManager() as mgr:
+        task = _find_task(mgr, task_id)
+
+    task_type = task.task_type
+    level = (task.config or {}).get("level", 1)
+
+    con = duckdb_store.connect(read_only=True)
+    try:
+        if task_type == "labeling" and level == 1:
+            df = con.execute(
+                """
+                SELECT news_id, title, major_category, confidence, label_source, created_at
+                FROM news_classified
+                WHERE task_id = ?
+                ORDER BY created_at
+                """,
+                [task_id],
+            ).pl()
+            filename = f"level1_{task_id}.parquet"
+        elif task_type == "labeling" and level == 2:
+            df = con.execute(
+                """
+                SELECT news_id, title, datetime, major_category, sub_category,
+                       sentiment, impact_score, confidence, label_source,
+                       analysis_logic, key_evidence, expectation,
+                       level1_task_id, created_at
+                FROM news_sub_classified
+                WHERE level2_task_id = ?
+                ORDER BY created_at
+                """,
+                [task_id],
+            ).pl()
+            filename = f"level2_{task_id}.parquet"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported task_type='{task_type}' level={level} for export.",
+            )
+    finally:
+        con.close()
+
+    if df.is_empty():
+        raise HTTPException(status_code=404, detail=f"No records found for task_id: {task_id}")
+
+    tmp = Path(tempfile.gettempdir()) / filename
+    df.write_parquet(tmp)
+
+    def iter_file(path: Path, chunk_size: int = 8192):
+        with open(path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                yield chunk
+        Path(path).unlink(missing_ok=True)
+
+    return StreamingResponse(
+        iter_file(tmp),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )

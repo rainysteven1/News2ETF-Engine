@@ -203,3 +203,15 @@ class ExperimentManager:
     def get_task_history(self, task_id: uuid.UUID) -> list[TaskHistory]:
         stmt = select(TaskHistory).where(TaskHistory.task_id == task_id).order_by(TaskHistory.created_at)
         return list(self.session.execute(stmt).scalars().all())
+
+    def find_task_by_run_id(self, run_id: str) -> Task | None:
+        """Find a task by its run_id stored in the result JSON."""
+        from src.db.models import Task
+        from sqlalchemy import func
+
+        stmt = select(Task).where(Task.result.isnot(None))
+        tasks = self.session.execute(stmt).scalars().all()
+        for t in tasks:
+            if isinstance(t.result, dict) and t.result.get("run_id") == run_id:
+                return t
+        return None

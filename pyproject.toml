@@ -30,10 +30,16 @@ dependencies = [
     "python-multipart>=0.0.22",
     "requests>=2.32.5",
     "boto3>=1.35.0",
+    "transformers>=4.40.0",
 ]
 
+
 [dependency-groups]
-dev = ["ruff>=0.15.5"]
+platform = []
+dev = [
+    "ruff>=0.15.5",
+    "uv>=0.10.12",
+]
 torch_cpu = ["torch==2.1.0+cpu", "torchvision==0.16.0+cpu"]
 torch_gpu = ["torch==2.1.0", "torchvision==0.16.0"]
 

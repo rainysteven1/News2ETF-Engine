@@ -72,6 +72,10 @@ class DuckDBStore:
                     major_category   VARCHAR,
                     sub_category     VARCHAR,
                     sentiment        VARCHAR,
+                    impact_score     FLOAT,
+                    analysis_logic   VARCHAR,
+                    key_evidence     VARCHAR,
+                    expectation      VARCHAR,
                     confidence       FLOAT,
                     label_source     VARCHAR,
                     level1_task_id   VARCHAR,
@@ -187,36 +191,15 @@ class DuckDBStore:
         con.execute("""
             INSERT OR IGNORE INTO news_sub_classified
                 (news_id, title, datetime, major_category, sub_category, sentiment,
+                 impact_score, analysis_logic, key_evidence, expectation,
                  confidence, label_source, level1_task_id, level2_task_id)
             SELECT news_id, title, datetime, major_category, sub_category, sentiment,
+                   impact_score, analysis_logic, key_evidence, expectation,
                    confidence, label_source, level1_task_id, level2_task_id
             FROM df
         """)
         con.commit()
         return len(labels)
-
-    def merge_classified(self, con: duckdb.DuckDBPyConnection, source_task_ids: list[str], target_task_id: str) -> int:
-        """Copy all level-1 labels from source tasks into target_task_id.
-
-        Duplicate news_ids are silently skipped (INSERT OR IGNORE).
-        All source_task_ids must be pre-validated UUIDs.
-        """
-        if not source_task_ids:
-            return 0
-        id_placeholders = ", ".join(["?"] * len(source_task_ids))
-        con.execute(
-            f"""
-            INSERT OR IGNORE INTO news_classified
-                (news_id, title, major_category, confidence, label_source, task_id)
-            SELECT news_id, title, major_category, confidence, label_source, ?
-            FROM news_classified
-            WHERE task_id IN ({id_placeholders})
-            """,
-            [target_task_id, *source_task_ids],
-        )
-        con.commit()
-        count = con.execute("SELECT COUNT(*) FROM news_classified WHERE task_id = ?", [target_task_id]).fetchone()[0]  # type: ignore
-        return count
 
     def export_training_data(
         self,

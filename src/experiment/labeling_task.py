@@ -6,6 +6,7 @@ and checkpoint management. Passes all dependencies into the pure
 business-logic functions in src.labeling.
 """
 
+import os
 import uuid
 from typing import Any
 
@@ -19,7 +20,7 @@ from src.db.models import TaskCheckpoint
 from src.db.store import DuckDBStore, duckdb_store
 from src.experiment.manager import ExperimentManager
 from src.labeling import Level1Config, Level2Config, run_level1, run_level2
-from src.utils.llm_client import get_llm_client
+from src.utils.llm_client import get_llm_client, resolve_provider
 from src.utils.loki_sink import LokiSink
 
 
@@ -153,58 +154,20 @@ class LabelingTaskExecutor(TaskExecutor):
                 "batch_size_l2",
                 "checkpoint_every",
                 "llm_retry",
-                "merge_source_task_ids",
             ],
         )
 
     def validate_params(self, params: dict[str, Any]) -> tuple[bool, str | None]:
-        # Merge task: combines results of multiple level-1 tasks, no LLM needed
-        if "merge_source_task_ids" in params:
-            source_ids = params["merge_source_task_ids"]
-            if not isinstance(source_ids, list) or len(source_ids) < 1:
-                return False, "merge_source_task_ids must be a non-empty list of task IDs"
-            root_cfg: dict | None = None
-            with ExperimentManager() as mgr:
-                for sid in source_ids:
-                    try:
-                        src_uuid = uuid.UUID(str(sid))
-                    except ValueError:
-                        return False, f"Invalid UUID in merge_source_task_ids: {sid}"
-                    src_task = mgr.get_task(src_uuid)
-                    if src_task is None:
-                        return False, f"Source task not found: {sid}"
-                    if src_task.task_type != "labeling":
-                        return False, f"Source task {sid} is not a labeling task"
-                    src_cfg = src_task.config or {}
-                    if src_cfg.get("level", 1) != 1:
-                        return False, f"Source task {sid} is not a level-1 task"
-                    compat_keys = ["model", "temperature"]
-                    if root_cfg is None:
-                        root_cfg = {k: src_cfg.get(k) for k in compat_keys}
-                    else:
-                        for k in compat_keys:
-                            if src_cfg.get(k) != root_cfg[k]:
-                                return False, (
-                                    f"Source task {sid} has incompatible config: "
-                                    f"{k}={src_cfg.get(k)!r} vs expected {root_cfg[k]!r}"
-                                )
-            return True, None
-
         if "model" not in params:
             return False, "Missing required param: model"
         if "temperature" not in params:
             return False, "Missing required param: temperature"
-
-        # Verify the model is in the registry and its API key is configured
-        from src.utils.llm_client import resolve_provider
 
         model = params["model"]
         try:
             provider = resolve_provider(model)
         except ValueError as e:
             return False, str(e)
-
-        import os
 
         if not os.environ.get(provider.key_env):
             return False, (f"Model '{model}' requires env var {provider.key_env} to be set")
@@ -295,31 +258,6 @@ class LabelingTaskExecutor(TaskExecutor):
 
         con = duckdb.connect(str(self.store.db_path))
         try:
-            # ── Merge task path: combine multiple level-1 tasks, no LLM ──────
-            merge_source_ids = cfg.get("merge_source_task_ids")
-            if merge_source_ids:
-                from src.common import console
-
-                source_ids = [str(sid) for sid in merge_source_ids]
-                console.print(
-                    f"\n[bold]Merging {len(source_ids)} level-1 tasks → Task ID {task_uuid_str[:12]}...[/bold]"
-                )
-                for sid in source_ids:
-                    console.print(f"  • [cyan]{sid}[/cyan]")
-                merged_count = self.store.merge_classified(con, source_ids, task_uuid_str)
-                console.print(
-                    f"[bold green]✓ Merge done[/bold green] — [bold]{merged_count}[/bold] labels in merged task"
-                )
-                summary = _build_summary(con, task_uuid_str, 1)
-                return {
-                    "status": "success",
-                    "message": f"Merged {merged_count} labels from {len(source_ids)} tasks",
-                    "total_labeled": merged_count,
-                    "level": 1,
-                    "merge_source_task_ids": source_ids,
-                    **summary,
-                }
-
             if level == 1:
                 assert isinstance(config, Level1Config)
                 run_level1(
@@ -375,6 +313,7 @@ class LabelingTaskExecutor(TaskExecutor):
                 "message": f"Task completed: {total} labels created",
                 "total_labeled": total,
                 "level": level,
+                "run_id": run_id,
                 "run_params": {
                     **config.model_dump(),
                     "sample_size": sample_size,
@@ -383,7 +322,7 @@ class LabelingTaskExecutor(TaskExecutor):
                 **summary,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e), "total_labeled": 0}
+            return {"status": "error", "message": str(e), "total_labeled": 0, "run_id": run_id}
         finally:
             con.close()
             _teardown_loki(loki_sink, loki_handler)

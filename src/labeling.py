@@ -162,10 +162,18 @@ class Level1AnalysisResult(BaseModel):
     items: list[Level1Item] = Field(min_length=1, description="新闻分类结果数组")
 
 
+class Level2Analysis(BaseModel):
+    logic: str = Field(description="为何不是中性？对 EPS 或估值的影响路径是什么？")
+    key_evidence: str = Field(description="提取正文/标题中的核心数据或事实点")
+    expectation: Literal["超预期", "符合预期", "低于预期"] = Field(description="市场预期")
+
+
 class Level2Item(BaseModel):
     title: str = Field(description="原始新闻标题")
-    sub: str = Field(description="细分行业标签（用于微调分类模型）")
-    sentiment: Literal["利好", "中性", "利空"] = Field(description="情感极性（用于对比 FinBERT 自带情感分析）")
+    sub: str = Field(description="细分行业标签（必须来自 YAML 列表）")
+    sentiment: Literal["利好", "中性", "利空"] = Field(description="情感极性")
+    impact_score: float = Field(ge=0.0, le=1.0, description="影响程度分数，0.0-1.0，分数越高影响越大")
+    analysis: Level2Analysis = Field(description="分析逻辑")
     confidence: float = Field(ge=0, le=1, description="模型对该分类的置信度")
 
 
@@ -844,6 +852,10 @@ def run_level2(
                                         "major_category": major,
                                         "sub_category": sub,
                                         "sentiment": r.get("sentiment", "中性"),
+                                        "impact_score": r.get("impact_score", 0.5),
+                                        "analysis_logic": r.get("analysis", {}).get("logic", ""),
+                                        "key_evidence": r.get("analysis", {}).get("key_evidence", ""),
+                                        "expectation": r.get("analysis", {}).get("expectation", "符合预期"),
                                         "confidence": conf,
                                         "label_source": label_source,
                                         "level1_task_id": batch[j]["task_id"],
