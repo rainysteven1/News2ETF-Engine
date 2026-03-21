@@ -12,18 +12,42 @@ from __future__ import annotations
 import json
 import random
 import time
+from typing import Any
 
 import numpy as np
 import torch
+from loguru import logger
+from pydantic import BaseModel
+from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-from finbert.config import FinBERTConfig, load_config
+from finbert.config import FinBERTConfig
 from finbert.dataset import NewsClassificationDataset
 from finbert.hierarchy import build_label_maps
 from finbert.model import load_finbert_classifier
 from finbert.wandb_handler import WandbHandler
+
+
+class EvalMetrics(BaseModel):
+    """Evaluation metrics returned by the evaluate() function."""
+
+    loss: float
+    l1_accuracy: float
+    l2_accuracy: float
+    sentiment_accuracy: float
+    # Raw predictions for confusion matrix logging — not logged to W&B directly
+    _l1_true: list[int] = []
+    _l1_pred: list[int] = []
+    _l2_true: list[int] = []
+    _l2_pred: list[int] = []
+    _sent_true: list[int] = []
+    _sent_pred: list[int] = []
+
+    def wandb_dict(self) -> dict[str, Any]:
+        """Return metrics dict without internal prediction fields."""
+        return self.model_dump(exclude={"_l1_true", "_l1_pred", "_l2_true", "_l2_pred", "_sent_true", "_sent_pred"})
 
 
 def set_seed(seed: int) -> None:
@@ -38,7 +62,7 @@ def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-) -> dict[str, float]:
+) -> EvalMetrics:
     """Run evaluation, return loss / accuracy metrics."""
     model.eval()
     total_loss = 0.0
@@ -79,18 +103,18 @@ def evaluate(
             all_sent_true.extend(batch["sentiment_label"].cpu().tolist())
             all_sent_pred.extend(sent_preds.cpu().tolist())
 
-    return {
-        "loss": total_loss / total,
-        "l1_accuracy": l1_correct / total,
-        "l2_accuracy": l2_correct / total,
-        "sentiment_accuracy": sent_correct / total,
-        "_l1_true": all_l1_true,
-        "_l1_pred": all_l1_pred,
-        "_l2_true": all_l2_true,
-        "_l2_pred": all_l2_pred,
-        "_sent_true": all_sent_true,
-        "_sent_pred": all_sent_pred,
-    }
+    return EvalMetrics(
+        loss=total_loss / total,
+        l1_accuracy=l1_correct / total,
+        l2_accuracy=l2_correct / total,
+        sentiment_accuracy=sent_correct / total,
+        _l1_true=all_l1_true,
+        _l1_pred=all_l1_pred,
+        _l2_true=all_l2_true,
+        _l2_pred=all_l2_pred,
+        _sent_true=all_sent_true,
+        _sent_pred=all_sent_pred,
+    )
 
 
 def train(cfg: FinBERTConfig) -> None:
@@ -103,7 +127,7 @@ def train(cfg: FinBERTConfig) -> None:
 
     set_seed(tcfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    logger.info(f"Device: {device}")
 
     # ── W&B ────────────────────────────────────────────────────────────
     wb = WandbHandler(cfg)
@@ -132,7 +156,7 @@ def train(cfg: FinBERTConfig) -> None:
         l1_to_idx=l1_to_idx,
         l2_to_idx=l2_to_idx,
     )
-    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+    logger.info(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=tcfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=tcfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -148,7 +172,7 @@ def train(cfg: FinBERTConfig) -> None:
         beta=lcfg.beta,
         gamma=lcfg.gamma,
     )
-    model.to(device)
+    model.to(device)  # type: ignore
 
     # ── Optimizer & Scheduler ──────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias"}
@@ -199,7 +223,7 @@ def train(cfg: FinBERTConfig) -> None:
 
             if (step + 1) % tcfg.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.max_grad_norm)
+                clip_grad_norm_(model.parameters(), tcfg.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -211,7 +235,7 @@ def train(cfg: FinBERTConfig) -> None:
             if global_step > 0 and global_step % ocfg.log_steps == 0:
                 avg = epoch_loss / (step + 1)
                 lr = scheduler.get_last_lr()[0]
-                print(
+                logger.info(
                     f"  [epoch {epoch + 1}/{tcfg.num_epochs}] step {global_step}, "
                     f"loss={avg:.4f}, l1_loss={outputs['l1_loss'].item():.4f}, "
                     f"l2_loss={outputs['l2_loss'].item():.4f}, "
@@ -231,59 +255,54 @@ def train(cfg: FinBERTConfig) -> None:
             # ── Eval & Save checkpoints ────────────────
             if global_step > 0 and global_step % ocfg.eval_steps == 0:
                 val_metrics = evaluate(model, val_loader, device)
-                print(
-                    f"  [eval step {global_step}] val_loss={val_metrics['loss']:.4f}, "
-                    f"l1_acc={val_metrics['l1_accuracy']:.4f}, l2_acc={val_metrics['l2_accuracy']:.4f}, "
-                    f"sent_acc={val_metrics['sentiment_accuracy']:.4f}"
+                logger.info(
+                    f"  [eval step {global_step}] val_loss={val_metrics.loss:.4f}, "
+                    f"l1_acc={val_metrics.l1_accuracy:.4f}, l2_acc={val_metrics.l2_accuracy:.4f}, "
+                    f"sent_acc={val_metrics.sentiment_accuracy:.4f}"
                 )
                 wb.log_metrics(
                     {
-                        "val/loss": val_metrics["loss"],
-                        "val/l1_accuracy": val_metrics["l1_accuracy"],
-                        "val/l2_accuracy": val_metrics["l2_accuracy"],
-                        "val/sentiment_accuracy": val_metrics["sentiment_accuracy"],
+                        "val/loss": val_metrics.loss,
+                        "val/l1_accuracy": val_metrics.l1_accuracy,
+                        "val/l2_accuracy": val_metrics.l2_accuracy,
+                        "val/sentiment_accuracy": val_metrics.sentiment_accuracy,
                     },
                     step=global_step,
                 )
-                if val_metrics["l2_accuracy"] > best_val_l2_acc:
-                    best_val_l2_acc = val_metrics["l2_accuracy"]
+                if val_metrics.l2_accuracy > best_val_l2_acc:
+                    best_val_l2_acc = val_metrics.l2_accuracy
                     save_dir = ocfg.output_dir / "best"
                     model.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
-                    print(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
+                    logger.success(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
                 model.train()
-
-            if global_step > 0 and global_step % ocfg.save_steps == 0:
-                ckpt_dir = ocfg.output_dir / f"checkpoint-{global_step}"
-                model.save_pretrained(ckpt_dir)
-                tokenizer.save_pretrained(ckpt_dir)
 
         # ── End of epoch ───────────────────────────────
         elapsed = time.time() - t0
         avg_loss = epoch_loss / len(train_loader)
         val_metrics = evaluate(model, val_loader, device)
-        print(
+        logger.info(
             f"Epoch {epoch + 1}/{tcfg.num_epochs} done in {elapsed:.1f}s — "
-            f"train_loss={avg_loss:.4f}, val_loss={val_metrics['loss']:.4f}, "
-            f"val_l1_acc={val_metrics['l1_accuracy']:.4f}, val_l2_acc={val_metrics['l2_accuracy']:.4f}, "
-            f"val_sent_acc={val_metrics['sentiment_accuracy']:.4f}"
+            f"train_loss={avg_loss:.4f}, val_loss={val_metrics.loss:.4f}, "
+            f"val_l1_acc={val_metrics.l1_accuracy:.4f}, val_l2_acc={val_metrics.l2_accuracy:.4f}, "
+            f"val_sent_acc={val_metrics.sentiment_accuracy:.4f}"
         )
         wb.log_metrics(
             {
                 "epoch/train_loss": avg_loss,
-                "epoch/val_loss": val_metrics["loss"],
-                "epoch/val_l1_accuracy": val_metrics["l1_accuracy"],
-                "epoch/val_l2_accuracy": val_metrics["l2_accuracy"],
-                "epoch/val_sentiment_accuracy": val_metrics["sentiment_accuracy"],
+                "epoch/val_loss": val_metrics.loss,
+                "epoch/val_l1_accuracy": val_metrics.l1_accuracy,
+                "epoch/val_l2_accuracy": val_metrics.l2_accuracy,
+                "epoch/val_sentiment_accuracy": val_metrics.sentiment_accuracy,
             },
             step=global_step,
         )
-        if val_metrics["l2_accuracy"] > best_val_l2_acc:
-            best_val_l2_acc = val_metrics["l2_accuracy"]
+        if val_metrics.l2_accuracy > best_val_l2_acc:
+            best_val_l2_acc = val_metrics.l2_accuracy
             save_dir = ocfg.output_dir / "best"
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
-            print(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
+            logger.success(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
 
     # ── Save final model & label maps ──────────────────
     final_dir = ocfg.output_dir / "final"
@@ -304,20 +323,20 @@ def train(cfg: FinBERTConfig) -> None:
     wb.log_summary(
         {
             "best_val_l2_accuracy": best_val_l2_acc,
-            "final_val_l1_accuracy": final_val["l1_accuracy"],
-            "final_val_l2_accuracy": final_val["l2_accuracy"],
-            "final_val_sentiment_accuracy": final_val["sentiment_accuracy"],
+            "final_val_l1_accuracy": final_val.l1_accuracy,
+            "final_val_l2_accuracy": final_val.l2_accuracy,
+            "final_val_sentiment_accuracy": final_val.sentiment_accuracy,
         }
     )
     if cfg.wandb.log_l2_cm:
         l2_names = [idx_to_l2[i] for i in range(len(idx_to_l2))]
         wb.log_confusion_matrix(
-            final_val["_l2_true"],
-            final_val["_l2_pred"],
+            final_val._l2_true,
+            final_val._l2_pred,
             class_names=l2_names,
             title="Level-2 Confusion Matrix",
         )
     wb.finish()
 
-    print(f"\nTraining complete. Best val L2 accuracy: {best_val_l2_acc:.4f}")
-    print(f"Checkpoints: {ocfg.output_dir}")
+    logger.info(f"\nTraining complete. Best val L2 accuracy: {best_val_l2_acc:.4f}")
+    logger.info(f"Checkpoints: {ocfg.output_dir}")

@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import torch
+from loguru import logger
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -37,7 +38,7 @@ def predict(
     level1, level2, sentiment, l1_confidence, l2_confidence, sentiment_confidence.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    logger.info(f"Device: {device}")
 
     checkpoint_dir = Path(checkpoint_dir)
 
@@ -70,7 +71,7 @@ def predict(
     all_sent_preds: list[int] = []
     all_sent_confs: list[float] = []
 
-    print(f"Running inference on {len(dataset)} samples...")
+    logger.info(f"Running inference on {len(dataset)} samples...")
     with torch.no_grad():
         for i, batch in enumerate(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -102,7 +103,7 @@ def predict(
             all_sent_confs.extend(sent_conf.cpu().tolist())
 
             if (i + 1) % 50 == 0:
-                print(f"  Processed {(i + 1) * batch_size}/{len(dataset)} samples")
+                logger.info(f"  Processed {(i + 1) * batch_size}/{len(dataset)} samples")
 
     # ── Assemble results (Polars) ───────────────────────
     df = dataset.meta.with_columns(
@@ -117,6 +118,6 @@ def predict(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(output_path)
-    print(f"Results saved to {output_path} ({len(df)} rows)")
+    logger.success(f"Results saved to {output_path} ({len(df)} rows)")
 
     return df

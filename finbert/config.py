@@ -54,7 +54,6 @@ class OutputConfig(BaseModel):
     output_dir: Path = _ROOT / "finbert" / "checkpoints"
     log_steps: int = 50
     eval_steps: int = 200
-    save_steps: int = 500
 
 
 class InferenceConfig(BaseModel):

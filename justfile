@@ -44,3 +44,9 @@ db-current:
 # Show full migration history
 db-history:
     uv run alembic history --verbose
+
+dev-sync:
+    uv sync --group platform --group dev --no-group finbert --no-group torch_cpu --no-group torch_gpu
+
+finbert-sync:
+    uv sync --group finbert --group dev --group torch_cpu --no-group platform --no-group torch_gpu
