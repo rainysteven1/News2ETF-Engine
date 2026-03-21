@@ -12,10 +12,12 @@ Pipeline:
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from collections.abc import Callable
 from random import sample as random_sample
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import duckdb
 import yaml
@@ -179,6 +181,51 @@ class Level2Item(BaseModel):
 
 class Level2AnalysisResult(BaseModel):
     items: list[Level2Item] = Field(min_length=1, description="金融新闻结构化标注结果列表")
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
+    """Multi-layer fallback JSON parsing:
+    1. Direct parse
+    2. List fallback (take first element)
+    3. Markdown code block extraction, then retry
+    """
+    # 1. Direct parse
+    try:
+        data = json.loads(raw)
+        return model_cls.model_validate(data)
+    except Exception as e:
+        logger.warning(f"   Direct JSON parse failed, trying fallbacks... Error: {e}")
+
+    # 2. List fallback
+    try:
+        lst = json.loads(raw)
+        if isinstance(lst, list) and lst:
+            return model_cls.model_validate(lst[0])
+    except Exception as e:
+        logger.warning(f"   List fallback parse failed, trying markdown extraction... Error: {e}")
+
+    # 3. Markdown code block extraction
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
+    if match:
+        json_str = match.group(1).strip()
+        try:
+            data = json.loads(json_str)
+            return model_cls.model_validate(data)
+        except Exception as e:
+            logger.warning(f"   Markdown extraction failed... Error: {e}")
+
+        # List fallback (if markdown contains a list)
+        try:
+            lst = json.loads(json_str)
+            if isinstance(lst, list) and lst:
+                return model_cls.model_validate(lst[0])
+        except Exception as e:
+            logger.warning(f"   List fallback failed... Error: {e}")
+
+    return None
 
 
 def _flush_checkpoint(
@@ -346,8 +393,6 @@ def _llm_classify_level1(
     t0 = time.time()
     _retry = config.llm_retry
     logger.info(f"LLM level-1 request batch={batch_idx}: {len(titles)} titles")
-    for i, t in enumerate(titles):
-        logger.debug(f"  sample {i + 1}: {t}")
 
     try:
         system_prompt = _load_level1_prompt(all_major_categories)
@@ -432,8 +477,7 @@ def _llm_classify_level2(
     item_count = len(titles)
     content_count = sum(1 for c in contents if c) if contents else 0
     logger.info(f"LLM level-2 request batch={batch_idx} [{major}]: {item_count} items ({content_count} with content)")
-    for i, t in enumerate(titles):
-        logger.debug(f"  sample {i + 1}: {t}")
+
     try:
         system_prompt = _load_level2_prompt(major, hierarchy[major])
         # Build user message: include content (truncated) when available
@@ -456,14 +500,13 @@ def _llm_classify_level2(
                 logger.warning(f"  level-2 [{major}] retry {attempt}/{_retry} after empty/parse failure")
                 time.sleep(1.0 * attempt)
             try:
-                response = client.beta.chat.completions.parse(
+                response = client.chat.completions.create(
                     model=config.model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content},
                     ],
                     max_tokens=config.max_tokens,
-                    response_format=Level2AnalysisResult,
                     temperature=config.temperature,
                     seed=config.seed,
                     extra_body={"reasoning_split": True},
@@ -471,14 +514,15 @@ def _llm_classify_level2(
 
                 elapsed = time.time() - t0
                 usage = LLMUsage.from_response(response, elapsed)
-                parsed_result = response.choices[0].message.parsed  # type: ignore[union-attr]
+                raw_content = response.choices[0].message.content or ""
+                parsed_result = _extract_json_from_response(raw_content, Level2AnalysisResult)
                 logger.info(f"  level-2 [{major}] response attempt={attempt + 1} parsed={parsed_result is not None}")
 
                 if parsed_result is None:
                     last_err = LLMParseError(
                         "LLM returned empty response",
                         titles=titles,
-                        raw_content=response.choices[0].message.content or "",  # type: ignore[union-attr]
+                        raw_content=raw_content,
                         contents=contents,
                         raw_request=user_content,
                     )
@@ -488,6 +532,7 @@ def _llm_classify_level2(
                     f"  level-2 [{major}] done — {elapsed:.2f}s  tokens={usage.total_tokens}"
                     f" cached={usage.cached_tokens}"
                 )
+
                 return [item.model_dump() for item in parsed_result.items], usage
             except LLMParseError:
                 raise
@@ -538,7 +583,6 @@ def run_level1(
     store: DuckDBStore,
     run_id: str | None = None,
     task_id: str | None = None,
-    seed: int | None = None,
     checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
     assert config.sample_size is not None, "sample_size must be specified in config for level-1"
@@ -550,8 +594,8 @@ def run_level1(
     # Sample from news_raw; seed makes the sample deterministic across ablation runs.
     # start (offset) allows continuation tasks to resume after a partial run.
     start = config.start
-    df = store.sample_news(con, config.sample_size, seed=seed, offset=start)
-    seed_note = f" seed={seed}" if seed is not None else ""
+    df = store.sample_news(con, config.sample_size, seed=config.seed, offset=start)
+    seed_note = f" seed={config.seed}" if config.seed is not None else ""
     start_note = f" start={start}" if start else ""
     console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}{start_note}")
 
@@ -732,7 +776,6 @@ def run_level2(
     store: DuckDBStore,
     run_id: str | None = None,
     task_id: str | None = None,
-    seed: int | None = None,
     checkpoint_fn: CheckpointFn | None = None,
 ) -> None:
     assert config.sample_size is not None, "sample_size must be specified in config for level-2"
@@ -864,6 +907,7 @@ def run_level2(
                                         "label_source": label_source,
                                         "level1_task_id": batch[j]["task_id"],
                                         "level2_task_id": current_task_id,
+                                        "run_id": run_id,
                                     }
                                 )
                 except LLMParseError as e:
@@ -887,7 +931,7 @@ def run_level2(
 
                 # Checkpoint every N batches
                 if batch_count % config.checkpoint_every == 0 and llm_batch_results:
-                    saved = store.save_sub_labels(con, llm_batch_results)
+                    saved = store.save_sub_labels(con, llm_batch_results, run_id)
                     if checkpoint_fn:
                         checkpoint_fn(run_id, "level2-llm", batch_count, saved)
                     total_saved += saved

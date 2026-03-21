@@ -185,7 +185,7 @@ class LabelingTaskExecutor(TaskExecutor):
             max_tokens=cfg.get("max_tokens"),
             checkpoint_every=cfg.get("checkpoint_every", labeling_defaults.checkpoint_every),
             llm_retry=cfg.get("llm_retry", labeling_defaults.llm_retry),
-            seed=cfg.get("seed"),
+            seed=cfg.get("seed", None),
             batch_size=cfg.get("batch_size", labeling_defaults.batch_size),
             sample_size=cfg.get("sample_size", None),
         )
@@ -216,8 +216,6 @@ class LabelingTaskExecutor(TaskExecutor):
         assert run_id is not None, "run_id must be provided for labeling tasks"
         checkpoint_fn = self._make_checkpoint_fn(run_id)
 
-        seed = cfg.get("seed", None)
-
         con = duckdb.connect(str(self.store.db_path))
         try:
             if level == 1:
@@ -229,7 +227,6 @@ class LabelingTaskExecutor(TaskExecutor):
                     store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
-                    seed=seed,
                     checkpoint_fn=checkpoint_fn,
                 )
             else:
@@ -241,7 +238,6 @@ class LabelingTaskExecutor(TaskExecutor):
                     store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
-                    seed=seed,
                     checkpoint_fn=checkpoint_fn,
                 )
 

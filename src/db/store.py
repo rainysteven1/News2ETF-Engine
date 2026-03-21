@@ -80,8 +80,9 @@ class DuckDBStore:
                     label_source     VARCHAR,
                     level1_task_id   VARCHAR,
                     level2_task_id   VARCHAR,
+                    run_id           VARCHAR,
                     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (news_id, level1_task_id, level2_task_id)
+                    PRIMARY KEY (news_id, level1_task_id, level2_task_id, run_id)
                 )
             """)
         finally:
@@ -183,7 +184,9 @@ class DuckDBStore:
         con.commit()
         return len(labels)
 
-    def save_sub_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict]) -> int:
+    def save_sub_labels(
+        self, con: duckdb.DuckDBPyConnection, labels: list[dict], run_id: str | None = None
+    ) -> int:
         """Insert level-2 label rows into news_sub_classified; silently skip duplicates."""
         if not labels:
             return 0
@@ -192,12 +195,12 @@ class DuckDBStore:
             INSERT OR IGNORE INTO news_sub_classified
                 (news_id, title, datetime, major_category, sub_category, sentiment,
                  impact_score, analysis_logic, key_evidence, expectation,
-                 confidence, label_source, level1_task_id, level2_task_id)
+                 confidence, label_source, level1_task_id, level2_task_id, run_id)
             SELECT news_id, title, datetime, major_category, sub_category, sentiment,
                    impact_score, analysis_logic, key_evidence, expectation,
-                   confidence, label_source, level1_task_id, level2_task_id
+                   confidence, label_source, level1_task_id, level2_task_id, ?
             FROM df
-        """)
+        """, [run_id])
         con.commit()
         return len(labels)
 
