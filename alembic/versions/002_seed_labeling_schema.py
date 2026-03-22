@@ -9,7 +9,6 @@ Create Date: 2026-03-21
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -152,13 +151,38 @@ def upgrade() -> None:
             "task_type": "labeling",
             "param_name": "sample_size",
             "param_type": "int",
-            "required": True,
+            "required": False,
             "default_val": None,
             "options": None,
             "min_val": 1.0,
             "max_val": None,
-            "description": "Number of news records to process",
+            "description": "Number of news records to process (optional for level-2; uses all if absent)",
+            "conditions_json": '{"required_when": {"level": 1}}',
+        },
+        # major_categories (level-2 filter)
+        {
+            "task_type": "labeling",
+            "param_name": "major_categories",
+            "param_type": "list",
+            "required": False,
+            "default_val": None,
+            "options": None,
+            "min_val": None,
+            "max_val": None,
+            "description": "Filter to specific major categories (from industry_dict.json)",
             "conditions_json": None,
+        },
+        {
+            "task_type": "labeling",
+            "param_name": "concurrency",
+            "param_type": "int",
+            "required": False,
+            "default_val": "1",
+            "options": None,
+            "min_val": 1.0,
+            "max_val": None,
+            "description": "Number of concurrent workers for level-2 (optional; parallelizes across major categories)",
+            "conditions_json": '{"required_when": {"level": 2}}',
         },
     ]
 
@@ -197,6 +221,15 @@ def upgrade() -> None:
             (task_type, rule_name, hook, error_message, params_json, created_at)
         VALUES
             ('labeling', 'validate_level1_task_id', 'validate_level1_task_id',
+             null, null, {now})
+        """
+    )
+    op.execute(
+        f"""
+        INSERT INTO param_validation_rules
+            (task_type, rule_name, hook, error_message, params_json, created_at)
+        VALUES
+            ('labeling', 'validate_major_categories', 'validate_major_categories',
              null, null, {now})
         """
     )

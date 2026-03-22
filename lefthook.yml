@@ -5,7 +5,7 @@ pre-commit:
   commands:
     python-format:
       glob: "*.py"
-      run: bash scripts/python_format.sh --staged
+      run: bash scripts/python_format.sh staged
       stage_fixed: true
 
 # Commit-msg hook: Lint commit message with git-cliff

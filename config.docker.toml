@@ -6,6 +6,17 @@ user = "news2etf"
 password = "news2etf_password"
 db = "news2etf"
 
+[clickhouse]
+host = "clickhouse"
+port = 8123
+database = "default"
+user = "default"
+password = "default"
+
+[redis]
+host = "redis"
+port = 6379
+
 [loki]
 url = "http://loki:3100"
 

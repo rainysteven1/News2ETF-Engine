@@ -45,6 +45,29 @@ def _ensure_bucket(client, bucket: str) -> None:
     _ensured_buckets.add(bucket)
 
 
+def download_object(bucket: str, key: str) -> bytes | None:
+    """Download an object from S3. Returns raw bytes or None on failure."""
+    try:
+        client = _get_s3_client()
+        response = client.get_object(Bucket=bucket, Key=key)
+        return response["Body"].read()
+    except Exception as e:
+        logger.warning(f"S3 download failed s3://{bucket}/{key}: {e}")
+        return None
+
+
+def download_json(bucket: str, key: str) -> dict[str, Any] | None:
+    """Download and parse JSON from S3. Returns dict or None on failure."""
+    data = download_object(bucket, key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        logger.warning(f"S3 JSON parse failed s3://{bucket}/{key}: {e}")
+        return None
+
+
 def upload_json(bucket: str, key: str, data: dict[str, Any]) -> bool:
     """Upload a JSON object to SeaweedFS. Returns True on success."""
     try:

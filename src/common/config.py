@@ -55,11 +55,26 @@ class LabelingConfig(BaseModel):
     llm_retry: int = 2
 
 
+class RedisConfig(BaseModel):
+    host: str = "localhost"
+    port: int = 6379
+
+
+class ClickHouseConfig(BaseModel):
+    host: str = "localhost"
+    port: int = 9000
+    database: str = "default"
+    user: str = "default"
+    password: str = ""
+
+
 class AppConfig(BaseModel):
     database: DatabaseConfig = DatabaseConfig()
     loki: LokiConfig = LokiConfig()
     s3: S3Config = S3Config()
     labeling: LabelingConfig = LabelingConfig()
+    clickhouse: ClickHouseConfig = ClickHouseConfig()
+    redis: RedisConfig = RedisConfig()
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────

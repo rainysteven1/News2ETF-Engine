@@ -45,7 +45,7 @@ db-current:
 db-history:
     uv run alembic history --verbose
 
-dev-sync:
+platform-sync:
     uv sync --group platform --group dev --no-group finbert --no-group torch_cpu --no-group torch_gpu
 
 finbert-sync:

@@ -180,6 +180,7 @@ class ExperimentManager:
         run_id: str,
         status: TaskStatus,
         result: dict[str, Any] | None = None,
+        summary: dict[str, Any] | None = None,
         error_msg: str | None = None,
     ) -> Run:
         run = self.session.get(Run, run_id)
@@ -189,6 +190,8 @@ class ExperimentManager:
         run.status = status.value if isinstance(status, TaskStatus) else status
         if result is not None:
             run.result = result
+        if summary is not None:
+            run.summary = summary
         if error_msg is not None:
             run.error_msg = error_msg
 
