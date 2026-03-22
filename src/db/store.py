@@ -69,7 +69,7 @@ class ClickHouseStore:
             ORDER BY news_id
         """)
 
-        # news_classified table with ReplacesMergeTree for idempotent writes
+        # news_classified table with ReplacingMergeTree for idempotent writes
         client.command("""
             CREATE TABLE IF NOT EXISTS news_classified (
                 news_id        String,
@@ -80,11 +80,11 @@ class ClickHouseStore:
                 task_id        String,
                 run_id         String,
                 created_at     DateTime DEFAULT now()
-            ) ENGINE = ReplacesMergeTree(run_id)
+            ) ENGINE = ReplacingMergeTree
             ORDER BY (news_id, task_id)
         """)
 
-        # news_sub_classified table with ReplacesMergeTree for idempotent writes
+        # news_sub_classified table with ReplacingMergeTree for idempotent writes
         client.command("""
             CREATE TABLE IF NOT EXISTS news_sub_classified (
                 news_id          String,
@@ -103,7 +103,7 @@ class ClickHouseStore:
                 level2_task_id   String,
                 run_id           String,
                 created_at       DateTime DEFAULT now()
-            ) ENGINE = ReplacesMergeTree(run_id)
+            ) ENGINE = ReplacingMergeTree
             ORDER BY (news_id, level2_task_id)
         """)
 
