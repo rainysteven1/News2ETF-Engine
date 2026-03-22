@@ -6,8 +6,12 @@ user = "news2etf"
 password = "news2etf_password"
 db = "news2etf"
 
-[duckdb]
-path = "data/news2etf-dev.duckdb"
+[clickhouse]
+host = "localhost"
+port = 48123
+database = "default"
+user = "default"
+password = "default"
 
 [loki]
 url = "http://localhost:43100"

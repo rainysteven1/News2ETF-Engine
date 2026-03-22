@@ -7,20 +7,21 @@ Logging sinks, checkpoint handlers, and stores are injected by the caller.
 Pipeline:
   1. Keyword matching on title → high-confidence hits (~60-70%)
   2. Remaining ambiguous titles → batch LLM via GLM-4-Flash
-  3. Results written to DuckDB news_classified table
+  3. Results written to ClickHouse news_classified table
 """
 
 from __future__ import annotations
 
-import json
 import re
 import time
+import traceback
 from collections.abc import Callable
 from random import sample as random_sample
 from typing import TYPE_CHECKING, Literal, TypeVar
 
-import duckdb
+import polars as pl
 import yaml
+from json_repair import repair_json
 from loguru import logger
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -31,7 +32,7 @@ from src.common import CONFIGS_DIR, console, get_config
 from src.utils.s3_client import upload_json as _s3_upload_json
 
 if TYPE_CHECKING:
-    from src.db.store import DuckDBStore
+    from src.db.store import ClickHouseStore
 
 # Type alias: (run_id, stage, batch_idx, saved_count) -> None
 CheckpointFn = Callable[[str | None, str, int, int], None]
@@ -200,14 +201,14 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
     """
     # 1. Direct parse
     try:
-        data = json.loads(raw)
+        data = repair_json(raw)
         return model_cls.model_validate(data)
     except Exception:
         pass
 
     # 2. List fallback
     try:
-        lst = json.loads(raw)
+        lst = repair_json(raw)
         if isinstance(lst, list) and lst:
             logger.info("  JSON parse: list fallback succeeded")
             return model_cls.model_validate(lst[0])
@@ -219,7 +220,7 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
     if match:
         json_str = match.group(1).strip()
         try:
-            data = json.loads(json_str)
+            data = repair_json(json_str)
             logger.info("  JSON parse: markdown extraction succeeded")
             return model_cls.model_validate(data)
         except Exception:
@@ -227,7 +228,7 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
 
         # List fallback (if markdown contains a list)
         try:
-            lst = json.loads(json_str)
+            lst = repair_json(json_str)
             if isinstance(lst, list) and lst:
                 logger.info("  JSON parse: markdown + list fallback succeeded")
                 return model_cls.model_validate(lst[0])
@@ -238,19 +239,18 @@ def _extract_json_from_response(raw: str, model_cls: type[T]) -> T | None:
 
 
 def _flush_checkpoint(
-    con: duckdb.DuckDBPyConnection,
     results: list[dict],
     run_id: str | None,
     stage: str,
     batch_idx: int,
     *,
-    store: DuckDBStore,
+    store: ClickHouseStore,
     checkpoint_fn: CheckpointFn | None = None,
 ) -> int:
-    """Flush accumulated results to DuckDB and optionally record checkpoint."""
+    """Flush accumulated results to store and optionally record checkpoint."""
     if not results:
         return 0
-    saved = store.save_labels(con, results, run_id=run_id)
+    saved = store.save_labels(results, run_id=run_id)
     if checkpoint_fn:
         checkpoint_fn(run_id, stage, batch_idx, saved)
     logger.info(f"Checkpoint [{stage}] batch={batch_idx} saved={saved}")
@@ -286,6 +286,7 @@ class Level2Config(LabelingConfig):
 
     level1_task_id: str
     major_categories: list[str] | None = None  # if None, use all major categories
+    concurrency: int = 1  # number of parallel workers for major categories
 
 
 # ──────────────────────────────────────────────
@@ -473,7 +474,7 @@ def _llm_classify_level1(
     except (LLMParseError, InsufficientBalanceError):
         raise
     except Exception as e:
-        logger.error(f"LLM level-1 request failed: {e}")
+        logger.error(f"LLM level-1 request failed: {type(e).__name__}: {e}")
         raise
 
 
@@ -536,6 +537,7 @@ def _llm_classify_level2(
         # Second attempt: JSON fixer (no retry)
         t0_fixer = time.time()
         logger.warning(f"  level-2 [{major}] batch={batch_idx} parse failed, trying JSON fixer...")
+
         fixer_response = client.chat.completions.create(
             model=config.model,
             messages=[
@@ -564,6 +566,8 @@ def _llm_classify_level2(
             logger.info(f"  level-2 [{major}] batch={batch_idx} fixer succeeded")
             return [item.model_dump() for item in parsed_result.items], total_usage
 
+        logger.error(f"  level-2 [{major}] batch={batch_idx} JSON fixer also failed to parse response")
+
         # Both attempts failed
         raise LLMParseError(
             "LLM returned unparseable response after fixer",
@@ -579,7 +583,7 @@ def _llm_classify_level2(
         if "1113" in err_str:
             logger.error(f"  level-2 [{major}] insufficient balance — terminating pipeline: {e}")
             raise InsufficientBalanceError(err_str) from e
-        logger.error(f"LLM level-2 [{major}] request failed: {e}")
+        logger.error(f"LLM level-2 [{major}] request failed: {type(e).__name__}: {e}")
         raise
 
 
@@ -597,11 +601,10 @@ def _group_by_major(items: list[dict]) -> dict[str, list[dict]]:
 
 
 def run_level1(
-    con: duckdb.DuckDBPyConnection,
     client: OpenAI,
     *,
     config: Level1Config,
-    store: DuckDBStore,
+    store: ClickHouseStore,
     run_id: str | None = None,
     task_id: str | None = None,
     checkpoint_fn: CheckpointFn | None = None,
@@ -615,7 +618,7 @@ def run_level1(
     # Sample from news_raw; seed makes the sample deterministic across ablation runs.
     # start (offset) allows continuation tasks to resume after a partial run.
     start = config.start
-    df = store.sample_news(con, config.sample_size, seed=config.seed, offset=start)
+    df = store.sample_news(config.sample_size, seed=config.seed, offset=start)
     seed_note = f" seed={config.seed}" if config.seed is not None else ""
     start_note = f" start={start}" if start else ""
     console.print(f"Fetched [bold]{len(df)}[/bold] records from news_raw{seed_note}{start_note}")
@@ -659,7 +662,6 @@ def run_level1(
     total_saved = 0
     if keyword_results:
         total_saved += _flush_checkpoint(
-            con,
             keyword_results,
             run_id,
             "level1-keyword",
@@ -724,7 +726,6 @@ def run_level1(
             # Checkpoint every N batches
             if batch_count % config.checkpoint_every == 0 and llm_batch_results:
                 total_saved += _flush_checkpoint(
-                    con,
                     llm_batch_results,
                     run_id,
                     "level1-llm",
@@ -740,7 +741,6 @@ def run_level1(
     # Flush remaining
     if llm_batch_results:
         total_saved += _flush_checkpoint(
-            con,
             llm_batch_results,
             run_id,
             "level1-llm",
@@ -790,12 +790,134 @@ def run_level1(
             )
 
 
+def _run_level2_major(
+    major: str,
+    pending: list[dict],
+    client: OpenAI,
+    config: Level2Config,
+    keyword_sub_map: dict[str, tuple[str, float]],
+    current_task_id: str,
+    run_id: str | None,
+    store: ClickHouseStore,
+    checkpoint_fn: CheckpointFn | None,
+) -> tuple[int, LLMUsage]:
+    """Process all batches for a single major category. Used by both serial and parallel paths.
+
+    Returns (total_saved, llm_usage).
+    """
+    batch_count = 0
+    total_batches = -(-len(pending) // config.batch_size)
+    llm_usage = LLMUsage()
+    llm_batch_results: list[dict] = []
+    total_saved = 0
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(f"LLM [{major}]", total=total_batches)
+        for i in range(0, len(pending), config.batch_size):
+            batch = pending[i : i + config.batch_size]
+            try:
+                titles = [r["title"] for r in batch]
+                batch_contents = [r.get("content") for r in batch]
+                logger.info(
+                    f"Processing batch [{batch_count}/{total_batches}] for major [{major}] with {len(batch)} items"
+                )
+
+                results, usage = _llm_classify_level2(
+                    client,
+                    titles,
+                    major,
+                    config,
+                    contents=batch_contents,
+                    batch_idx=batch_count,
+                )
+                llm_usage.add(usage)
+                logger.info(
+                    f"  level-2 [{major}] batch={batch_count}/{total_batches} — "
+                    f"prompt={usage.prompt_tokens:,} completion={usage.completion_tokens:,} "
+                    f"total={usage.total_tokens:,} time={usage.total_time:.2f}s"
+                )
+                for j, r in enumerate(results):
+                    if j < len(batch):
+                        news_id_str = str(batch[j]["news_id"])
+                        # Determine sub_category and label_source
+                        if major in _single_sub_majors:
+                            sub = _single_sub_majors[major]
+                            conf = r.get("confidence", 0.5)
+                            label_source = "auto+llm"
+                        elif news_id_str in keyword_sub_map:
+                            sub, conf = keyword_sub_map[news_id_str]
+                            label_source = "keyword+llm"
+                        else:
+                            sub = r.get("sub", "")
+                            conf = r.get("confidence", 0.5)
+                            label_source = "llm"
+                        if sub in sub_to_major:
+                            llm_batch_results.append(
+                                {
+                                    "news_id": batch[j]["news_id"],
+                                    "title": batch[j]["title"],
+                                    "datetime": batch[j]["datetime"],
+                                    "major_category": major,
+                                    "sub_category": sub,
+                                    "sentiment": r.get("sentiment", "中性"),
+                                    "impact_score": r.get("impact_score", 0.5),
+                                    "analysis_logic": r.get("analysis", {}).get("logic", ""),
+                                    "key_evidence": r.get("analysis", {}).get("key_evidence", ""),
+                                    "expectation": r.get("analysis", {}).get("expectation", "符合预期"),
+                                    "confidence": conf,
+                                    "label_source": label_source,
+                                    "level1_task_id": batch[j]["task_id"],
+                                    "level2_task_id": current_task_id,
+                                    "run_id": run_id,
+                                }
+                            )
+            except LLMParseError as e:
+                _dump_llm_error(
+                    e,
+                    level=2,
+                    task_id=current_task_id,
+                    run_id=run_id,
+                    major=major,
+                    batch_idx=batch_count,
+                    model=config.model,
+                )
+                progress.console.print(f"  [red]✗ batch {batch_count} [{major}] parse failed (dumped to S3): {e}[/red]")
+            except InsufficientBalanceError:
+                raise
+            except Exception as e:
+                progress.console.print(f"  [red]✗ batch failed: {e}[/red]")
+            batch_count += 1
+            progress.advance(task)
+
+            # Checkpoint every N batches
+            if batch_count % config.checkpoint_every == 0 and llm_batch_results:
+                saved = store.save_sub_labels(llm_batch_results, run_id)
+                if checkpoint_fn:
+                    checkpoint_fn(run_id, "level2-llm", batch_count, saved)
+                total_saved += saved
+                llm_batch_results = []
+
+    # Flush remaining LLM results
+    if llm_batch_results:
+        saved = store.save_sub_labels(llm_batch_results, run_id)
+        if checkpoint_fn:
+            checkpoint_fn(run_id, "level2-llm", batch_count, saved)
+        total_saved += saved
+
+    return total_saved, llm_usage
+
+
 def run_level2(
-    con: duckdb.DuckDBPyConnection,
     client: OpenAI,
     *,
     config: Level2Config,
-    store: DuckDBStore,
+    store: ClickHouseStore,
     run_id: str | None = None,
     task_id: str | None = None,
     checkpoint_fn: CheckpointFn | None = None,
@@ -810,6 +932,17 @@ def run_level2(
     source_task_id = config.level1_task_id
     console.print(f"  Level-1 Task ID: [cyan]{source_task_id[:12]}...[/cyan]")
 
+    # Determine effective concurrency
+    majors_count = len(config.major_categories) if config.major_categories else len(all_major_categories)
+    effective_concurrency = config.concurrency
+    if effective_concurrency > majors_count:
+        logger.warning(
+            f"concurrency={effective_concurrency} > number of majors ({majors_count}), downgrading to {majors_count}"
+        )
+        effective_concurrency = majors_count
+
+    console.print(f"  Concurrency: [cyan]{effective_concurrency}[/cyan] (majors: {majors_count})")
+
     # Build WHERE clause for major_categories filter
     major_filter = ""
     if config.major_categories:
@@ -817,24 +950,30 @@ def run_level2(
         major_filter = f"AND c.major_category IN ({cats})"
 
     # Fetch ALL eligible level-1 results (no LIMIT yet)
-    df = con.execute(
+    rows = store.execute(
         f"""
         SELECT c.news_id, c.title, c.major_category, c.task_id, r.datetime, r.content
         FROM news_classified c
         JOIN news_raw r ON c.news_id = r.news_id
-        WHERE c.task_id = ?
+        WHERE c.task_id = %(source_id)s
           AND c.major_category IS NOT NULL
           {major_filter}
           AND NOT EXISTS (
               SELECT 1 FROM news_sub_classified sc
               WHERE sc.news_id = c.news_id
                 AND sc.level1_task_id = c.task_id
-                AND sc.level2_task_id = ?
+                AND sc.level2_task_id = %(task_id)s
           )
         ORDER BY c.news_id
         """,
-        [source_task_id, current_task_id],
-    ).pl()
+        {"source_id": source_task_id, "task_id": current_task_id},
+    )
+    if rows:
+        df = pl.DataFrame(
+            rows, schema=["news_id", "title", "major_category", "task_id", "datetime", "content"], orient="row"
+        )
+    else:
+        df = pl.DataFrame(schema=["news_id", "title", "major_category", "task_id", "datetime", "content"])
 
     total_eligible = len(df)
     console.print(f"Fetched [bold]{total_eligible}[/bold] eligible records from news_classified")
@@ -879,116 +1018,60 @@ def run_level2(
     )
 
     # Phase 2: LLM for all items (sentiment + sub for non-keyword)
-    llm_batch_results: list[dict] = []
     total_saved = 0
     llm_usage = LLMUsage()
-    for major, pending in llm_pending_by_major.items():
-        batch_count = 0
-        total_batches = -(-len(pending) // config.batch_size)
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(f"LLM [{major}]", total=total_batches)
-            for i in range(0, len(pending), config.batch_size):
-                batch = pending[i : i + config.batch_size]
+    if effective_concurrency <= 1:
+        # Serial path (original behavior)
+        for major, pending in llm_pending_by_major.items():
+            saved, usage = _run_level2_major(
+                major=major,
+                pending=pending,
+                client=client,
+                config=config,
+                keyword_sub_map=keyword_sub_map,
+                current_task_id=current_task_id,
+                run_id=run_id,
+                store=store,
+                checkpoint_fn=checkpoint_fn,
+            )
+            total_saved += saved
+            llm_usage.add(usage)
+            logger.info(f"Completed major [{major}]: saved={saved}")
+            time.sleep(0.5)
+    else:
+        # Parallel path using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        majors = list(llm_pending_by_major.keys())
+        console.print(f"  Running [bold]{effective_concurrency}[/bold] parallel workers...")
+
+        with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+            futures = {
+                executor.submit(
+                    _run_level2_major,
+                    major,
+                    llm_pending_by_major[major],
+                    client,
+                    config,
+                    keyword_sub_map,
+                    current_task_id,
+                    run_id,
+                    store,
+                    checkpoint_fn,
+                ): major
+                for major in majors
+            }
+
+            for future in as_completed(futures):
+                major = futures[future]
                 try:
-                    titles = [r["title"] for r in batch]
-                    batch_contents = [r.get("content") for r in batch]
-                    logger.info(
-                        f"Processing batch [{batch_count}/{total_batches}] for major [{major}] with {len(batch)} items"
-                    )
-
-                    results, usage = _llm_classify_level2(
-                        client,
-                        titles,
-                        major,
-                        config,
-                        contents=batch_contents,
-                        batch_idx=batch_count,
-                    )
-                    llm_usage.add(usage)
-                    logger.info(
-                        f"  level-2 [{major}] batch={batch_count}/{total_batches} — "
-                        f"prompt={usage.prompt_tokens:,} completion={usage.completion_tokens:,} "
-                        f"total={usage.total_tokens:,} time={usage.total_time:.2f}s"
-                    )
-                    for j, r in enumerate(results):
-                        if j < len(batch):
-                            news_id_str = str(batch[j]["news_id"])
-                            # Determine sub_category and label_source
-                            if major in _single_sub_majors:
-                                sub = _single_sub_majors[major]
-                                conf = r.get("confidence", 0.5)
-                                label_source = "auto+llm"
-                            elif news_id_str in keyword_sub_map:
-                                sub, conf = keyword_sub_map[news_id_str]
-                                label_source = "keyword+llm"
-                            else:
-                                sub = r.get("sub", "")
-                                conf = r.get("confidence", 0.5)
-                                label_source = "llm"
-                            if sub in sub_to_major:
-                                llm_batch_results.append(
-                                    {
-                                        "news_id": batch[j]["news_id"],
-                                        "title": batch[j]["title"],
-                                        "datetime": batch[j]["datetime"],
-                                        "major_category": major,
-                                        "sub_category": sub,
-                                        "sentiment": r.get("sentiment", "中性"),
-                                        "impact_score": r.get("impact_score", 0.5),
-                                        "analysis_logic": r.get("analysis", {}).get("logic", ""),
-                                        "key_evidence": r.get("analysis", {}).get("key_evidence", ""),
-                                        "expectation": r.get("analysis", {}).get("expectation", "符合预期"),
-                                        "confidence": conf,
-                                        "label_source": label_source,
-                                        "level1_task_id": batch[j]["task_id"],
-                                        "level2_task_id": current_task_id,
-                                        "run_id": run_id,
-                                    }
-                                )
-                except LLMParseError as e:
-                    _dump_llm_error(
-                        e,
-                        level=2,
-                        task_id=current_task_id,
-                        run_id=run_id,
-                        major=major,
-                        batch_idx=batch_count,
-                        model=config.model,
-                    )
-                    progress.console.print(
-                        f"  [red]✗ batch {batch_count} [{major}] parse failed (dumped to S3): {e}[/red]"
-                    )
-                except InsufficientBalanceError:
-                    raise
-                except Exception as e:
-                    progress.console.print(f"  [red]✗ batch failed: {e}[/red]")
-                batch_count += 1
-                progress.advance(task)
-
-                # Checkpoint every N batches
-                if batch_count % config.checkpoint_every == 0 and llm_batch_results:
-                    saved = store.save_sub_labels(con, llm_batch_results, run_id)
-                    if checkpoint_fn:
-                        checkpoint_fn(run_id, "level2-llm", batch_count, saved)
+                    saved, usage = future.result()
                     total_saved += saved
-                    llm_batch_results = []
-
-                if i + config.batch_size < len(pending):
-                    time.sleep(0.5)
-
-    # Flush remaining LLM results
-    if llm_batch_results:
-        saved = store.save_sub_labels(con, llm_batch_results, run_id)
-        if checkpoint_fn:
-            checkpoint_fn(run_id, "level2-llm", batch_count, saved)
-        total_saved += saved
+                    llm_usage.add(usage)
+                    logger.info(f"Completed major [{major}]: saved={saved}")
+                except Exception as e:
+                    logger.error(f"Major [{major}] failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     console.print(
         f"[bold green]✓ Level-2 done[/bold green] — updated [bold]{len(keyword_results) + total_saved}[/bold] labels"
@@ -1031,33 +1114,34 @@ def run_level2(
             )
 
 
-def print_label_stats(con: duckdb.DuckDBPyConnection) -> None:
-    stats = con.execute("""
+def print_label_stats(store: ClickHouseStore) -> None:
+    stats = store.execute("""
         SELECT major_category, label_source, COUNT(*) AS cnt,
-               ROUND(AVG(confidence), 3) AS avg_conf
+               round(AVG(confidence), 3) AS avg_conf
         FROM news_classified
         WHERE major_category IS NOT NULL
         GROUP BY major_category, label_source
         ORDER BY major_category, label_source
-    """).pl()
+    """)
 
     table = Table(title="Label Statistics", show_lines=True)
     table.add_column("Major Category", style="cyan")
     table.add_column("Source", style="bold")
     table.add_column("Count", justify="right")
     table.add_column("Avg Confidence", justify="right", style="magenta")
-    for row in stats.iter_rows(named=True):
-        src_style = "green" if row["label_source"] == "keyword" else "yellow"
+    for row in stats:
+        major, source, cnt, avg_conf = row
+        src_style = "green" if source == "keyword" else "yellow"
         table.add_row(
-            row["major_category"] or "-",
-            f"[{src_style}]{row['label_source']}[/]",
-            str(row["cnt"]),
-            str(row["avg_conf"]),
+            major or "-",
+            f"[{src_style}]{source}[/]",
+            str(cnt),
+            str(avg_conf),
         )
     console.print(table)
 
-    total = con.execute("SELECT COUNT(*) FROM news_classified").fetchone()[0]  # type: ignore
-    kw_count = con.execute("SELECT COUNT(*) FROM news_classified WHERE label_source = 'keyword'").fetchone()[0]  # type: ignore
+    total = store.execute("SELECT COUNT(*) FROM news_classified")[0][0]
+    kw_count = store.execute("SELECT COUNT(*) FROM news_classified WHERE label_source = 'keyword'")[0][0]
     console.print(
         f"Total: [bold]{total}[/bold] | Keyword: [green]{kw_count}[/green] | LLM: [yellow]{total - kw_count}[/yellow]"
     )

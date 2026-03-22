@@ -10,59 +10,55 @@ Usage:
   uv run scripts/analyze_content_length.py
 """
 
-from pathlib import Path
-
-import duckdb
 from rich.console import Console
 from rich.table import Table
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DB_PATH = DATA_DIR / "news2etf.duckdb"
+from src.common.config import get_config
 
 console = Console()
 
 
 def main() -> None:
-    if not DB_PATH.exists():
-        console.print(f"[red]Database not found: {DB_PATH}[/red]")
-        return
+    ch_cfg = get_config().clickhouse
+    from clickhouse_connect import get_client
 
-    con = duckdb.connect(str(DB_PATH), read_only=True)
+    client = get_client(
+        host=ch_cfg.host,
+        port=ch_cfg.port,
+        database=ch_cfg.database,
+        username=ch_cfg.user,
+        password=ch_cfg.password,
+    )
 
     console.print("\n[bold cyan]Fetching length stats from news_raw...[/bold cyan]")
 
-    stats = con.execute("""
+    result = client.query("""
         SELECT
             COUNT(*)                                        AS total_rows,
-
-            -- title
-            MAX(LENGTH(title))                              AS title_max,
-            ROUND(AVG(LENGTH(title)), 1)                   AS title_avg,
-            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY LENGTH(title))  AS title_p50,
-            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY LENGTH(title))  AS title_p90,
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY LENGTH(title))  AS title_p95,
-            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY LENGTH(title))  AS title_p99,
-
-            -- content
-            MAX(LENGTH(content))                            AS content_max,
-            ROUND(AVG(LENGTH(content)), 1)                 AS content_avg,
-            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY LENGTH(content)) AS content_p50,
-            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY LENGTH(content)) AS content_p90,
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY LENGTH(content)) AS content_p95,
-            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY LENGTH(content)) AS content_p99,
-
-            -- total (title + content)
-            MAX(LENGTH(title) + LENGTH(content))                              AS total_max,
-            ROUND(AVG(LENGTH(title) + LENGTH(content)), 1)                   AS total_avg,
-            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY LENGTH(title) + LENGTH(content)) AS total_p50,
-            PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY LENGTH(title) + LENGTH(content)) AS total_p90,
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY LENGTH(title) + LENGTH(content)) AS total_p95,
-            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY LENGTH(title) + LENGTH(content)) AS total_p99
+            MAX(length(title))                              AS title_max,
+            round(AVG(length(title)), 1)                   AS title_avg,
+            quantile(0.50)(length(title))                  AS title_p50,
+            quantile(0.90)(length(title))                  AS title_p90,
+            quantile(0.95)(length(title))                  AS title_p95,
+            quantile(0.99)(length(title))                  AS title_p99,
+            MAX(length(content))                            AS content_max,
+            round(AVG(length(content)), 1)                 AS content_avg,
+            quantile(0.50)(length(content))                AS content_p50,
+            quantile(0.90)(length(content))                AS content_p90,
+            quantile(0.95)(length(content))                AS content_p95,
+            quantile(0.99)(length(content))                AS content_p99,
+            MAX(length(title) + length(content))                              AS total_max,
+            round(AVG(length(title) + length(content)), 1)                   AS total_avg,
+            quantile(0.50)(length(title) + length(content))                AS total_p50,
+            quantile(0.90)(length(title) + length(content))                AS total_p90,
+            quantile(0.95)(length(title) + length(content))                AS total_p95,
+            quantile(0.99)(length(title) + length(content))                AS total_p99
         FROM news_raw
         WHERE title IS NOT NULL
-    """).fetchone()
+    """)
 
-    if stats is None:
+    row = result.result_rows[0]
+    if row is None:
         console.print("[red]No data found in news_raw.[/red]")
         return
 
@@ -86,7 +82,7 @@ def main() -> None:
         ttl_p90,
         ttl_p95,
         ttl_p99,
-    ) = stats
+    ) = row
 
     console.print(f"  Total rows: [bold]{total_rows:,}[/bold]\n")
 
@@ -124,13 +120,18 @@ def main() -> None:
     # Distribution: how many rows fall within common content truncation thresholds
     console.print("\n[bold]Content length distribution (truncation impact)[/bold]")
     thresholds = [300, 500, 800, 1000, 1500, 2000, 3000, 5000]
-    dist = con.execute(f"""
+
+    threshold_expr = ", ".join(f"sum(if(length(content) <= {t}, 1, 0)) as le{t}" for t in thresholds)
+    dist_query = f"""
         SELECT
-            {", ".join(f"SUM(CASE WHEN LENGTH(content) <= {t} THEN 1 ELSE 0 END) AS le{t}" for t in thresholds)},
+            {threshold_expr},
             COUNT(*) AS total
         FROM news_raw
         WHERE title IS NOT NULL AND content IS NOT NULL
-    """).fetchone()
+    """
+
+    dist_result = client.query(dist_query)
+    dist = dist_result.result_rows[0]
 
     if dist:
         *counts, total_with_content = dist
@@ -142,8 +143,6 @@ def main() -> None:
             pct = count / total_with_content * 100 if total_with_content else 0
             dist_table.add_row(f"≤ {threshold:,}", f"{count:,}", f"{pct:.1f}%")
         console.print(dist_table)
-
-    con.close()
 
 
 if __name__ == "__main__":

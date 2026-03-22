@@ -331,10 +331,7 @@ def get_distribution(run_id: str) -> dict:
     news_sub_classified (level-2) depending on the task configuration.
     Only returns results when run status is COMPLETED.
     """
-    from src.db.store import duckdb_store
-
-    if not duckdb_store.db_path.exists():
-        raise HTTPException(status_code=503, detail="DuckDB not initialised.")
+    from src.db.store import store
 
     # 1. Get run and task info
     with ExperimentManager() as mgr:
@@ -355,89 +352,85 @@ def get_distribution(run_id: str) -> dict:
     level = cfg.get("level", 1)
     task_uuid_str = str(task.task_id)
 
-    con = duckdb_store.connect(read_only=True)
-    try:
-        if task_type == "labeling" and level == 1:
-            rows = con.execute(
-                """
-                SELECT major_category, label_source, COUNT(*) AS cnt,
-                       ROUND(AVG(confidence), 3) AS avg_conf
-                FROM news_classified
-                WHERE task_id = ? AND run_id = ?
-                GROUP BY major_category, label_source
-                ORDER BY major_category, label_source
-                """,
-                [task_uuid_str, run_id],
-            ).fetchall()
+    if task_type == "labeling" and level == 1:
+        rows = store.execute(
+            """
+            SELECT major_category, label_source, COUNT(*) AS cnt,
+                   round(AVG(confidence), 3) AS avg_conf
+            FROM news_classified
+            WHERE task_id = %(task_id)s AND run_id = %(run_id)s
+            GROUP BY major_category, label_source
+            ORDER BY major_category, label_source
+            """,
+            {"task_id": task_uuid_str, "run_id": run_id},
+        )
 
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"No level-1 results found for run_id: {run_id}")
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"No level-1 results found for run_id: {run_id}")
 
-            by_source: dict = {}
-            by_major: dict = {}
-            total = 0
-            for major, source, cnt, avg_conf in rows:
-                total += cnt
-                by_source[source] = by_source.get(source, 0) + cnt
-                by_major.setdefault(major or "unknown", {})[source] = {
-                    "count": cnt,
-                    "avg_confidence": avg_conf,
-                }
-
-            return {
-                "run_id": run_id,
-                "task_id": task_uuid_str,
-                "level": 1,
-                "total": total,
-                "by_label_source": by_source,
-                "by_major_category": by_major,
+        by_source: dict = {}
+        by_major: dict = {}
+        total = 0
+        for major, source, cnt, avg_conf in rows:
+            total += cnt
+            by_source[source] = by_source.get(source, 0) + cnt
+            by_major.setdefault(major or "unknown", {})[source] = {
+                "count": cnt,
+                "avg_confidence": avg_conf,
             }
 
-        elif task_type == "labeling" and level == 2:
-            rows = con.execute(
-                """
-                SELECT major_category, sub_category, label_source,
-                       sentiment, COUNT(*) AS cnt,
-                       ROUND(AVG(confidence), 3) AS avg_conf
-                FROM news_sub_classified
-                WHERE level2_task_id = ? AND run_id = ?
-                GROUP BY major_category, sub_category, label_source, sentiment
-                ORDER BY major_category, sub_category
-                """,
-                [task_uuid_str, run_id],
-            ).fetchall()
+        return {
+            "run_id": run_id,
+            "task_id": task_uuid_str,
+            "level": 1,
+            "total": total,
+            "by_label_source": by_source,
+            "by_major_category": by_major,
+        }
 
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"No level-2 results found for run_id: {run_id}")
+    elif task_type == "labeling" and level == 2:
+        rows = store.execute(
+            """
+            SELECT major_category, sub_category, label_source,
+                   sentiment, COUNT(*) AS cnt,
+                   round(AVG(confidence), 3) AS avg_conf
+            FROM news_sub_classified
+            WHERE level2_task_id = %(task_id)s AND run_id = %(run_id)s
+            GROUP BY major_category, sub_category, label_source, sentiment
+            ORDER BY major_category, sub_category
+            """,
+            {"task_id": task_uuid_str, "run_id": run_id},
+        )
 
-            by_source: dict = {}
-            by_sub: dict = {}
-            by_sentiment: dict = {}
-            total = 0
-            for major, sub, source, sentiment, cnt, avg_conf in rows:
-                total += cnt
-                by_source[source] = by_source.get(source, 0) + cnt
-                key = f"{major} / {sub}"
-                by_sub.setdefault(key, {})[source] = {"count": cnt, "avg_confidence": avg_conf}
-                if sentiment:
-                    by_sentiment[sentiment] = by_sentiment.get(sentiment, 0) + cnt
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"No level-2 results found for run_id: {run_id}")
 
-            return {
-                "run_id": run_id,
-                "task_id": task_uuid_str,
-                "level": 2,
-                "total": total,
-                "by_label_source": by_source,
-                "by_sub_category": by_sub,
-                "by_sentiment": by_sentiment,
-            }
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported task_type='{task_type}' level={level} for result.",
-            )
-    finally:
-        con.close()
+        by_source: dict = {}
+        by_sub: dict = {}
+        by_sentiment: dict = {}
+        total = 0
+        for major, sub, source, sentiment, cnt, avg_conf in rows:
+            total += cnt
+            by_source[source] = by_source.get(source, 0) + cnt
+            key = f"{major} / {sub}"
+            by_sub.setdefault(key, {})[source] = {"count": cnt, "avg_confidence": avg_conf}
+            if sentiment:
+                by_sentiment[sentiment] = by_sentiment.get(sentiment, 0) + cnt
+
+        return {
+            "run_id": run_id,
+            "task_id": task_uuid_str,
+            "level": 2,
+            "total": total,
+            "by_label_source": by_source,
+            "by_sub_category": by_sub,
+            "by_sentiment": by_sentiment,
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported task_type='{task_type}' level={level} for result.",
+        )
 
 
 # ── Export ─────────────────────────────────────────────────────────────────────
@@ -450,10 +443,8 @@ def export_task_labels(task_id: str) -> StreamingResponse:
     - level=1: exports from news_classified WHERE task_id = ?
     - level=2: exports from news_sub_classified WHERE level2_task_id = ?
     """
-    from src.db.store import duckdb_store
-
-    if not duckdb_store.db_path.exists():
-        raise HTTPException(status_code=503, detail="DuckDB not initialised.")
+    import polars as pl
+    from src.db.store import store
 
     # 1. Verify task exists
     with ExperimentManager() as mgr:
@@ -462,40 +453,62 @@ def export_task_labels(task_id: str) -> StreamingResponse:
     task_type = task.task_type
     level = (task.config or {}).get("level", 1)
 
-    con = duckdb_store.connect(read_only=True)
-    try:
-        if task_type == "labeling" and level == 1:
-            df = con.execute(
-                """
-                SELECT news_id, title, major_category, confidence, label_source, created_at
-                FROM news_classified
-                WHERE task_id = ?
-                ORDER BY created_at
-                """,
-                [task_id],
-            ).pl()
-            filename = f"level1_{task_id}.parquet"
-        elif task_type == "labeling" and level == 2:
-            df = con.execute(
-                """
-                SELECT news_id, title, datetime, major_category, sub_category,
-                       sentiment, impact_score, confidence, label_source,
-                       analysis_logic, key_evidence, expectation,
-                       level1_task_id, created_at
-                FROM news_sub_classified
-                WHERE level2_task_id = ?
-                ORDER BY created_at
-                """,
-                [task_id],
-            ).pl()
-            filename = f"level2_{task_id}.parquet"
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported task_type='{task_type}' level={level} for export.",
+    if task_type == "labeling" and level == 1:
+        rows = store.execute(
+            """
+            SELECT news_id, title, major_category, confidence, label_source, created_at
+            FROM news_classified
+            WHERE task_id = %(task_id)s
+            ORDER BY created_at
+            """,
+            {"task_id": task_id},
+        )
+        if rows:
+            df = pl.DataFrame(
+                rows,
+                schema=["news_id", "title", "major_category", "confidence", "label_source", "created_at"],
             )
-    finally:
-        con.close()
+        else:
+            df = pl.DataFrame(schema=["news_id", "title", "major_category", "confidence", "label_source", "created_at"])
+        filename = f"level1_{task_id}.parquet"
+    elif task_type == "labeling" and level == 2:
+        rows = store.execute(
+            """
+            SELECT news_id, title, datetime, major_category, sub_category,
+                   sentiment, impact_score, confidence, label_source,
+                   analysis_logic, key_evidence, expectation,
+                   level1_task_id, created_at
+            FROM news_sub_classified
+            WHERE level2_task_id = %(task_id)s
+            ORDER BY created_at
+            """,
+            {"task_id": task_id},
+        )
+        if rows:
+            df = pl.DataFrame(
+                rows,
+                schema=[
+                    "news_id", "title", "datetime", "major_category", "sub_category",
+                    "sentiment", "impact_score", "confidence", "label_source",
+                    "analysis_logic", "key_evidence", "expectation",
+                    "level1_task_id", "created_at",
+                ],
+            )
+        else:
+            df = pl.DataFrame(
+                schema=[
+                    "news_id", "title", "datetime", "major_category", "sub_category",
+                    "sentiment", "impact_score", "confidence", "label_source",
+                    "analysis_logic", "key_evidence", "expectation",
+                    "level1_task_id", "created_at",
+                ],
+            )
+        filename = f"level2_{task_id}.parquet"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported task_type='{task_type}' level={level} for export.",
+        )
 
     if df.is_empty():
         raise HTTPException(status_code=404, detail=f"No records found for task_id: {task_id}")

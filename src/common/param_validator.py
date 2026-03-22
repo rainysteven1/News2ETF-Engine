@@ -196,15 +196,9 @@ def _get_industry_major_categories() -> list[str]:
 
 @register_hook("labeling", "validate_level1_task_id")
 def _validate_level1_task_id(params: dict[str, Any], rule: ValidationRule) -> tuple[bool, str | None]:
-    """Hook: level=2 requires a valid level1_task_id that points to a level-1 labeling task.
-
-    If the task is not in PostgreSQL but exists in DuckDB (orphan), allow it with a warning.
-    """
-    import duckdb
-
+    """Hook: level=2 requires a valid level1_task_id that points to a level-1 labeling task."""
     from src.db import Task
     from src.db.session import get_session
-    from src.db.store import duckdb_store
 
     level = params.get("level", 1)
     level1_task_id = params.get("level1_task_id")
@@ -231,22 +225,19 @@ def _validate_level1_task_id(params: dict[str, Any], rule: ValidationRule) -> tu
             return False, f"Referenced task is not a level-1 task: {level1_task_id}"
         return True, None
 
-    # Not in PostgreSQL — check DuckDB
-    if duckdb_store.db_path.exists():
-        con = duckdb.connect(str(duckdb_store.db_path), read_only=True)
-        try:
-            row = con.execute(
-                "SELECT 1 FROM news_classified WHERE task_id = ? LIMIT 1",
-                [str(level1_task_id)],
-            ).fetchone()
-        finally:
-            con.close()
-        if row is not None:
-            logger.warning(
-                f"level1_task_id={level1_task_id} not found in PostgreSQL "
-                f"but found in DuckDB — allowing orphan level-1 reference"
-            )
-            return True, None
+    # Not in PostgreSQL — check ClickHouse news_classified for orphaned level-1 reference
+    from src.db.store import store as clickhouse_store
+
+    row = clickhouse_store.execute(
+        "SELECT 1 FROM news_classified WHERE task_id = %(task_id)s LIMIT 1",
+        {"task_id": str(level1_task_id)},
+    )
+    if row:
+        logger.warning(
+            f"level1_task_id={level1_task_id} not found in PostgreSQL "
+            f"but found in ClickHouse — allowing orphan level-1 reference"
+        )
+        return True, None
 
     return False, f"level1_task_id not found: {level1_task_id}"
 
@@ -265,6 +256,26 @@ def _validate_major_categories(params: dict[str, Any], rule: ValidationRule) -> 
     invalid = [c for c in major_categories if c not in valid_majors]
     if invalid:
         return False, f"Unknown major_categories: {invalid}. Valid ones: {sorted(valid_majors)}"
+
+    return True, None
+
+
+@register_hook("labeling", "validate_concurrency")
+def _validate_concurrency(params: dict[str, Any], rule: ValidationRule) -> tuple[bool, str | None]:
+    """Hook: concurrency (if provided) must be an int >= 1."""
+    concurrency = params.get("concurrency")
+    if concurrency is None:
+        return True, None  # optional field
+
+    if not isinstance(concurrency, int) or isinstance(concurrency, bool):
+        return False, f"concurrency must be an int, got {type(concurrency).__name__}"
+
+    if concurrency < 1:
+        return False, f"concurrency must be >= 1, got {concurrency}"
+
+    valid_majors = set(_get_industry_major_categories())
+    if concurrency > len(valid_majors):
+        return False, f"concurrency {concurrency} exceeds number of valid major_categories {len(valid_majors)}"
 
     return True, None
 

@@ -55,8 +55,12 @@ class LabelingConfig(BaseModel):
     llm_retry: int = 2
 
 
-class DuckDBConfig(BaseModel):
-    path: str = "data/news2etf.duckdb"
+class ClickHouseConfig(BaseModel):
+    host: str = "localhost"
+    port: int = 9000
+    database: str = "default"
+    user: str = "default"
+    password: str = ""
 
 
 class AppConfig(BaseModel):
@@ -64,7 +68,7 @@ class AppConfig(BaseModel):
     loki: LokiConfig = LokiConfig()
     s3: S3Config = S3Config()
     labeling: LabelingConfig = LabelingConfig()
-    duckdb: DuckDBConfig = DuckDBConfig()
+    clickhouse: ClickHouseConfig = ClickHouseConfig()
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────

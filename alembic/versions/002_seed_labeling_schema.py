@@ -173,6 +173,18 @@ def upgrade() -> None:
             "description": "Filter to specific major categories (from industry_dict.json)",
             "conditions_json": None,
         },
+        {
+            "task_type": "labeling",
+            "param_name": "concurrency",
+            "param_type": "int",
+            "required": False,
+            "default_val": "1",
+            "options": None,
+            "min_val": 1.0,
+            "max_val": None,
+            "description": "Number of concurrent workers for level-2 labeling (optional; if >1, will parallelize across major categories)",
+            "conditions_json": '{"required_when": {"level": 2}}',
+        },
     ]
 
     now = sa.func.now()
