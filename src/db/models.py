@@ -191,9 +191,7 @@ class ProviderCredential(Base):
         DateTime(timezone=True), default=lambda: datetime.now(), onupdate=lambda: datetime.now()
     )
 
-    __table_args__ = (
-        Index("ix_provider_credentials_provider_key_active", "provider_key", "is_active"),
-    )
+    __table_args__ = (Index("ix_provider_credentials_provider_key_active", "provider_key", "is_active"),)
 
     def __repr__(self) -> str:
         return f"<ProviderCredential(provider_key={self.provider_key}, is_active={self.is_active})>"
@@ -212,9 +210,7 @@ class ModelMetaRule(Base):
         DateTime(timezone=True), default=lambda: datetime.now(), onupdate=lambda: datetime.now()
     )
 
-    __table_args__ = (
-        Index("ix_model_meta_rules_provider_key", "provider_key"),
-    )
+    __table_args__ = (Index("ix_model_meta_rules_provider_key", "provider_key"),)
 
     def __repr__(self) -> str:
         return f"<ModelMetaRule(model_name={self.model_name}, provider_key={self.provider_key})>"

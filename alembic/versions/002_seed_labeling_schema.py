@@ -156,7 +156,7 @@ def upgrade() -> None:
             "options": None,
             "min_val": 1.0,
             "max_val": None,
-            "description": "Number of news records to process (optional for level-2; if absent, uses all eligible records)",
+            "description": "Number of news records to process (optional for level-2; uses all if absent)",
             "conditions_json": '{"required_when": {"level": 1}}',
         },
         # major_categories (level-2 filter)
@@ -181,7 +181,7 @@ def upgrade() -> None:
             "options": None,
             "min_val": 1.0,
             "max_val": None,
-            "description": "Number of concurrent workers for level-2 labeling (optional; if >1, will parallelize across major categories)",
+            "description": "Number of concurrent workers for level-2 (optional; parallelizes across major categories)",
             "conditions_json": '{"required_when": {"level": 2}}',
         },
     ]

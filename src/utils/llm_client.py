@@ -64,9 +64,7 @@ def resolve_provider(model: str) -> ProviderConfig:
     provider_key = _MODEL_REGISTRY.get(model)
     if provider_key is None:
         known = ", ".join(sorted(_MODEL_REGISTRY))
-        raise ValueError(
-            f"Unknown model '{model}'. Add it via alembic migration. Known models: {known}"
-        )
+        raise ValueError(f"Unknown model '{model}'. Add it via alembic migration. Known models: {known}")
     provider = _PROVIDER_CACHE.get(provider_key)
     if provider is None:
         raise ValueError(f"Provider '{provider_key}' for model '{model}' is not loaded in credentials cache")

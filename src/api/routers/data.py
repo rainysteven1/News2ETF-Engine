@@ -70,9 +70,32 @@ def get_labels(
 
     rows = store.execute(query, bind_params if bind_params else None)
     if rows:
-        df = pl.DataFrame(rows, schema=["news_id", "title", "major_category", "confidence", "label_source", "task_id", "run_id", "created_at"])
+        df = pl.DataFrame(
+            rows,
+            schema=[
+                "news_id",
+                "title",
+                "major_category",
+                "confidence",
+                "label_source",
+                "task_id",
+                "run_id",
+                "created_at",
+            ],
+        )
     else:
-        df = pl.DataFrame(schema=["news_id", "title", "major_category", "confidence", "label_source", "task_id", "run_id", "created_at"])
+        df = pl.DataFrame(
+            schema=[
+                "news_id",
+                "title",
+                "major_category",
+                "confidence",
+                "label_source",
+                "task_id",
+                "run_id",
+                "created_at",
+            ]
+        )
 
     records: list[dict[str, Any]] = df.to_dicts()
     return DataLabelsResponse(total=len(records), records=records)

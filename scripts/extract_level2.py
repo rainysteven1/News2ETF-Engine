@@ -26,7 +26,7 @@ def extract_json_after_think(text):
 
 if __name__ == "__main__":
     json_path = Path("./tmp.json")
-    with open(json_path, "r") as f:
+    with open(json_path) as f:
         data = json.load(f)
 
     raw_response = data["raw_response"]

@@ -867,9 +867,7 @@ def _run_level2_batch(
     try:
         titles = [r["title"] for r in batch]
         batch_contents = [r.get("content") for r in batch]
-        logger.info(
-            f"Processing batch [{batch_idx}/{total_batches}] for major [{major}] with {len(batch)} items"
-        )
+        logger.info(f"Processing batch [{batch_idx}/{total_batches}] for major [{major}] with {len(batch)} items")
 
         results, usage = _llm_classify_level2(
             client,
@@ -1247,7 +1245,9 @@ def run_level2(
                             )
                         logger.info(f"Completed major [{major}]: saved={major_total_saved[major]}")
                 except Exception as e:
-                    logger.error(f"Batch [{major}][{batch_idx}] failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    logger.error(
+                        f"Batch [{major}][{batch_idx}] failed: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    )
 
         llm_usage = LLMUsage()
         for usage in major_total_usage.values():

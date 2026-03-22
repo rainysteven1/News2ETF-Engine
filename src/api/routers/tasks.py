@@ -447,6 +447,7 @@ def export_task_labels(task_id: str) -> StreamingResponse:
     - level=2: exports from news_sub_classified WHERE level2_task_id = ?
     """
     import polars as pl
+
     from src.db.store import store
 
     # 1. Verify task exists
@@ -491,19 +492,39 @@ def export_task_labels(task_id: str) -> StreamingResponse:
             df = pl.DataFrame(
                 rows,
                 schema=[
-                    "news_id", "title", "datetime", "major_category", "sub_category",
-                    "sentiment", "impact_score", "confidence", "label_source",
-                    "analysis_logic", "key_evidence", "expectation",
-                    "level1_task_id", "created_at",
+                    "news_id",
+                    "title",
+                    "datetime",
+                    "major_category",
+                    "sub_category",
+                    "sentiment",
+                    "impact_score",
+                    "confidence",
+                    "label_source",
+                    "analysis_logic",
+                    "key_evidence",
+                    "expectation",
+                    "level1_task_id",
+                    "created_at",
                 ],
             )
         else:
             df = pl.DataFrame(
                 schema=[
-                    "news_id", "title", "datetime", "major_category", "sub_category",
-                    "sentiment", "impact_score", "confidence", "label_source",
-                    "analysis_logic", "key_evidence", "expectation",
-                    "level1_task_id", "created_at",
+                    "news_id",
+                    "title",
+                    "datetime",
+                    "major_category",
+                    "sub_category",
+                    "sentiment",
+                    "impact_score",
+                    "confidence",
+                    "label_source",
+                    "analysis_logic",
+                    "key_evidence",
+                    "expectation",
+                    "level1_task_id",
+                    "created_at",
                 ],
             )
         filename = f"level2_{task_id}.parquet"
