@@ -1,0 +1,15 @@
+name: Code Lint and Format Check
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/ruff-action@v3
+      - run: bash scripts/python_format.sh all

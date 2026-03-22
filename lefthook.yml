@@ -1,6 +1,13 @@
 # Lefthook Configuration for RCABench
 # https://github.com/evilmartians/lefthook
 
+pre-commit:
+  commands:
+    python-format:
+      glob: "*.py"
+      run: bash scripts/python_format.sh --staged
+      stage_fixed: true
+
 # Commit-msg hook: Lint commit message with git-cliff
 commit-msg:
   commands:
@@ -9,12 +16,12 @@ commit-msg:
         # Extract commit message
         COMMIT_MSG_FILE={1}
         COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
-        
+
         # Check conventional commit format using git-cliff
         # git-cliff expects conventional commits format:
         # <type>[optional scope]: <description>
         # Examples: feat: add new feature, fix(api): resolve bug
-        
+
         echo "$COMMIT_MSG" | grep -qE "^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?: .{1,}" || {
           echo "❌ Commit message does not follow Conventional Commits format!"
           echo ""
@@ -28,4 +35,3 @@ commit-msg:
           echo "  docs: update installation guide"
           exit 1
         }
-

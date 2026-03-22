@@ -145,9 +145,7 @@ class ParamSchema(Base):
         DateTime(timezone=True), default=lambda: datetime.now(), onupdate=lambda: datetime.now()
     )
 
-    __table_args__ = (
-        Index("ix_param_schemas_task_type_param_name", "task_type", "param_name", unique=True),
-    )
+    __table_args__ = (Index("ix_param_schemas_task_type_param_name", "task_type", "param_name", unique=True),)
 
     def __repr__(self) -> str:
         return f"<ParamSchema(task_type={self.task_type}, param={self.param_name})>"
@@ -166,9 +164,7 @@ class ParamValidationRule(Base):
     params_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now())
 
-    __table_args__ = (
-        Index("ix_param_validation_rules_task_type_rule_name", "task_type", "rule_name", unique=True),
-    )
+    __table_args__ = (Index("ix_param_validation_rules_task_type_rule_name", "task_type", "rule_name", unique=True),)
 
     def __repr__(self) -> str:
         return f"<ParamValidationRule(task_type={self.task_type}, rule={self.rule_name})>"

@@ -84,9 +84,7 @@ class TaskParamSchema(BaseModel):
 
         with get_session() as session:
             rows = session.query(ParamSchema).filter_by(task_type=task_type).all()
-            rule_rows = (
-                session.query(ParamValidationRule).filter_by(task_type=task_type).all()
-            )
+            rule_rows = session.query(ParamValidationRule).filter_by(task_type=task_type).all()
 
         if not rows and not rule_rows:
             raise ValueError(f"No param schema found for task_type={task_type!r}")

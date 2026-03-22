@@ -162,7 +162,7 @@ class DuckDBStore:
         """Insert level-1 label rows into news_classified; silently skip duplicates."""
         if not labels:
             return 0
-        df = pl.DataFrame(
+        df = pl.DataFrame(  # noqa: F841
             [
                 {
                     "news_id": r["news_id"],
@@ -184,14 +184,13 @@ class DuckDBStore:
         con.commit()
         return len(labels)
 
-    def save_sub_labels(
-        self, con: duckdb.DuckDBPyConnection, labels: list[dict], run_id: str | None = None
-    ) -> int:
+    def save_sub_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict], run_id: str | None = None) -> int:
         """Insert level-2 label rows into news_sub_classified; silently skip duplicates."""
         if not labels:
             return 0
         df = pl.DataFrame(labels)  # noqa: F841
-        con.execute("""
+        con.execute(
+            """
             INSERT OR IGNORE INTO news_sub_classified
                 (news_id, title, datetime, major_category, sub_category, sentiment,
                  impact_score, analysis_logic, key_evidence, expectation,
@@ -200,7 +199,9 @@ class DuckDBStore:
                    impact_score, analysis_logic, key_evidence, expectation,
                    confidence, label_source, level1_task_id, level2_task_id, ?
             FROM df
-        """, [run_id])
+        """,
+            [run_id],
+        )
         con.commit()
         return len(labels)
 
