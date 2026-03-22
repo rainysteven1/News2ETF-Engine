@@ -13,6 +13,7 @@ from loguru import logger
 from alembic import command
 from src.api.routers import data, experiments, industry, labeling, tasks
 from src.common.config import ROOT_DIR
+from src.db.llm_config import ensure_llm_config
 
 # Controlled by main.py CLI; default True so `uvicorn src.api.app:app` still migrates.
 # Set RUN_MIGRATE=false via env var to skip migrations (e.g. for swagger export).
@@ -43,6 +44,9 @@ async def lifespan(app: FastAPI):
     if RUN_MIGRATE:
         alembic_cfg = Config(str(ROOT_DIR / "alembic.ini"))
         command.upgrade(alembic_cfg, "head")
+
+    logger.info("Bootstrapping LLM configuration from YAML...")
+    ensure_llm_config()
     if SYNC_APIFOX:
         logger.info("Syncing OpenAPI schema to Apifox...")
         try:

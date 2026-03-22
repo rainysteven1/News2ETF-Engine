@@ -1,3 +1,6 @@
+# LLM credentials (contains sensitive API keys)
+configs/llm_credentials.yaml
+
 # Python-generated files
 __pycache__/
 *.py[oc]

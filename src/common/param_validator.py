@@ -160,15 +160,15 @@ def _check_conditions(params: dict[str, Any], meta: ParamMetadata, param_name: s
 # ── Built-in hooks for labeling task ────────────────────────────────────────
 @register_hook("labeling", "validate_model_env_var")
 def _validate_model_env_var(params: dict[str, Any], rule: ValidationRule) -> tuple[bool, str | None]:
-    """Hook: check model is registered and its API key env var is set."""
-    from src.utils.llm_client import MODEL_REGISTRY, resolve_provider
+    """Hook: check model is registered and its provider has valid credentials."""
+    from src.utils.llm_client import _MODEL_REGISTRY, resolve_provider
 
     model = params.get("model")
     if model is None:
         return True, None  # let required check handle this
 
-    if model not in MODEL_REGISTRY:
-        known = ", ".join(sorted(MODEL_REGISTRY))
+    if model not in _MODEL_REGISTRY:
+        known = ", ".join(sorted(_MODEL_REGISTRY))
         return False, f"Unknown model {model!r}. Known models: {known}"
 
     try:
@@ -176,9 +176,8 @@ def _validate_model_env_var(params: dict[str, Any], rule: ValidationRule) -> tup
     except ValueError as e:
         return False, str(e)
 
-    env_var = provider.key_env
-    if not os.environ.get(env_var):
-        return False, f"Model {model!r} requires env var {env_var} to be set"
+    if not provider.api_key:
+        return False, f"Model {model!r} has no API key configured for provider {provider.provider_key!r}"
     return True, None
 
 

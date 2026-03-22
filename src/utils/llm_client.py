@@ -1,99 +1,89 @@
 """LLM client factory.
 
-Reads provider credentials from environment variables and returns an
-OpenAI-compatible client.  The provider is looked up from an explicit
-model registry — MODEL_REGISTRY maps exact model names to providers.
-
-To add a new model: add its exact name to MODEL_REGISTRY below.
-To add a new provider: add a ProviderConfig entry to PROVIDERS.
+Reads provider credentials and model registry from PostgreSQL DB (bootstrapped from
+configs/llm_credentials.yaml) and returns an OpenAI-compatible client.
 """
 
 from __future__ import annotations
-
-import os
 
 from openai import OpenAI
 from pydantic import BaseModel
 
 
 class ProviderConfig(BaseModel):
-    key_env: str
-    url_env: str
-    default_url: str
+    """Provider configuration loaded from DB."""
 
-    def api_key(self) -> str | None:
-        return os.environ.get(self.key_env)
-
-    def base_url(self) -> str:
-        return os.environ.get(self.url_env) or self.default_url
+    provider_key: str
+    api_key: str
+    base_url: str
 
 
-PROVIDERS: dict[str, ProviderConfig] = {
-    "zhipu": ProviderConfig(
-        key_env="ZHIPU_API_KEY",
-        url_env="ZHIPU_BASE_URL",
-        default_url="https://open.bigmodel.cn/api/paas/v4",
-    ),
-    "minimax": ProviderConfig(
-        key_env="MINIMAX_API_KEY",
-        url_env="MINIMAX_BASE_URL",
-        default_url="https://api.minimaxi.chat/v1",
-    ),
-    "openai": ProviderConfig(
-        key_env="OPENAI_API_KEY",
-        url_env="OPENAI_BASE_URL",
-        default_url="https://api.openai.com/v1",
-    ),
-}
+# In-memory caches: loaded from DB at startup
+_PROVIDER_CACHE: dict[str, ProviderConfig] = {}
+_MODEL_REGISTRY: dict[str, str] = {}  # model_name -> provider_key
 
-# Explicit model registry — exact model name → provider key in PROVIDERS
-# Add new models here as they become available.
-MODEL_REGISTRY: dict[str, str] = {
-    # ── Zhipu GLM ──────────────────────────────────────────────────────────
-    "glm-4-flash": "zhipu",
-    "glm-4.7": "zhipu",
-    "glm-4.5-airx": "zhipu",
-    "glm-4.7-flashx": "zhipu",
-    # ── MiniMax ────────────────────────────────────────────────────────────
-    "MiniMax-M2.7": "minimax",
-    "MiniMax-M2.7-highspeed": "minimax",
-    "MiniMax-M2.5": "minimax",
-    "MiniMax-M2.5-highspeed": "minimax",
-    "MiniMax-M2.1": "minimax",
-    "MiniMax-M2.1-highspeed": "minimax",
-    # ── OpenAI ─────────────────────────────────────────────────────────────
-    "gpt-4o": "openai",
-    "gpt-4o-mini": "openai",
-    "gpt-4-turbo": "openai",
-    "o1": "openai",
-    "o1-mini": "openai",
-    "o3": "openai",
-    "o3-mini": "openai",
-}
+
+def _load_from_db() -> None:
+    """Load provider credentials and model metadata from DB into memory cache.
+
+    Called at module import time to ensure credentials are available.
+    """
+    global _PROVIDER_CACHE, _MODEL_REGISTRY
+
+    try:
+        from src.db.models import ModelMetaRule, ProviderCredential
+        from src.db.session import get_session
+
+        with get_session() as session:
+            # Load active provider credentials
+            creds = session.query(ProviderCredential).filter_by(is_active=True).all()
+            for cred in creds:
+                _PROVIDER_CACHE[cred.provider_key] = ProviderConfig(
+                    provider_key=cred.provider_key,
+                    api_key=cred.api_key,
+                    base_url=cred.base_url,
+                )
+
+            # Load model metadata
+            models = session.query(ModelMetaRule).all()
+            _MODEL_REGISTRY = {m.model_name: m.provider_key for m in models}
+
+    except Exception:
+        # If DB is not available yet (e.g., import before DB init), leave cache empty
+        pass
 
 
 def resolve_provider(model: str) -> ProviderConfig:
     """Return the ProviderConfig for *model*.
 
-    Raises ValueError if the model is not in MODEL_REGISTRY.
+    Raises ValueError if the model is not in model registry or provider is not loaded.
     """
-    provider_key = MODEL_REGISTRY.get(model)
+    if not _PROVIDER_CACHE:
+        _load_from_db()
+
+    provider_key = _MODEL_REGISTRY.get(model)
     if provider_key is None:
-        known = ", ".join(sorted(MODEL_REGISTRY))
+        known = ", ".join(sorted(_MODEL_REGISTRY))
         raise ValueError(
-            f"Unknown model '{model}'. Add it to MODEL_REGISTRY in src/utils/llm_client.py. Known models: {known}"
+            f"Unknown model '{model}'. Add it via alembic migration. Known models: {known}"
         )
-    return PROVIDERS[provider_key]
+    provider = _PROVIDER_CACHE.get(provider_key)
+    if provider is None:
+        raise ValueError(f"Provider '{provider_key}' for model '{model}' is not loaded in credentials cache")
+    return provider
 
 
 def get_llm_client(model: str) -> OpenAI:
     """Return an OpenAI-compatible client for *model*.
 
     Raises:
-        ValueError: If model is unknown or the required API key env var is not set.
+        ValueError: If model is unknown or the provider credentials are not available.
     """
     provider = resolve_provider(model)
-    api_key = provider.api_key()
-    if not api_key:
-        raise ValueError(f"Model '{model}' requires env var {provider.key_env} to be set")
-    return OpenAI(api_key=api_key, base_url=provider.base_url())
+    if not provider.api_key:
+        raise ValueError(f"Model '{model}' has no API key configured for provider '{provider.provider_key}'")
+    return OpenAI(api_key=provider.api_key, base_url=provider.base_url)
+
+
+# Load credentials at module import
+_load_from_db()

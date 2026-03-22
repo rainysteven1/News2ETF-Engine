@@ -169,3 +169,52 @@ class ParamValidationRule(Base):
 
     def __repr__(self) -> str:
         return f"<ParamValidationRule(task_type={self.task_type}, rule={self.rule_name})>"
+
+
+class ProviderCredential(Base):
+    """LLM provider credentials loaded from YAML and stored in DB.
+
+    Multiple credentials can exist for the same provider_key (e.g., multiple accounts).
+    Use is_active=True to mark the currently used credential.
+    """
+
+    __tablename__ = "provider_credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    yaml_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(), onupdate=lambda: datetime.now()
+    )
+
+    __table_args__ = (
+        Index("ix_provider_credentials_provider_key_active", "provider_key", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProviderCredential(provider_key={self.provider_key}, is_active={self.is_active})>"
+
+
+class ModelMetaRule(Base):
+    """Model metadata and provider association. Seeded via alembic migration."""
+
+    __tablename__ = "model_meta_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    model_name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(), onupdate=lambda: datetime.now()
+    )
+
+    __table_args__ = (
+        Index("ix_model_meta_rules_provider_key", "provider_key"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ModelMetaRule(model_name={self.model_name}, provider_key={self.provider_key})>"
