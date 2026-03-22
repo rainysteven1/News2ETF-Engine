@@ -13,7 +13,9 @@ Pipeline:
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -837,6 +839,156 @@ def run_level1(
     return llm_usage
 
 
+def _run_level2_batch(
+    major: str,
+    batch: list[dict],
+    batch_idx: int,
+    total_batches: int,
+    client: OpenAI,
+    config: Level2Config,
+    keyword_sub_map: dict[str, tuple[str, float]],
+    sub_to_major: dict[str, str],
+    current_task_id: str,
+    run_id: str | None,
+    store: ClickHouseStore,
+    checkpoint_fn: CheckpointFn | None,
+    manager: ProgressManager | None,
+    pending_counter: dict[str, int],
+    pending_lock: threading.Lock,
+) -> tuple[int, LLMUsage, bool, list[Level2LabelResult]]:
+    """Process a single batch for level-2 labeling. Thread-safe.
+
+    Returns (saved_count, llm_usage, is_last_batch, remaining_in_buffer).
+    """
+    batch_error: str | None = None
+    batch_usage = LLMUsage()
+    llm_batch_results: list[Level2LabelResult] = []
+
+    try:
+        titles = [r["title"] for r in batch]
+        batch_contents = [r.get("content") for r in batch]
+        logger.info(
+            f"Processing batch [{batch_idx}/{total_batches}] for major [{major}] with {len(batch)} items"
+        )
+
+        results, usage = _llm_classify_level2(
+            client,
+            titles,
+            major,
+            config,
+            contents=batch_contents,
+            batch_idx=batch_idx,
+        )
+
+        batch_usage = usage
+        logger.info(
+            f"  level-2 [{major}] batch={batch_idx}/{total_batches} — "
+            f"prompt={batch_usage.prompt_tokens:,} completion={batch_usage.completion_tokens:,} "
+            f"total={batch_usage.total_tokens:,} time={batch_usage.total_time:.2f}s"
+        )
+
+        for j, r in enumerate(results):
+            if j >= len(batch):
+                continue
+            news_id_str = str(batch[j]["news_id"])
+            # Determine sub_category and label_source
+            if major in _single_sub_majors:
+                sub = _single_sub_majors[major]
+                conf = r.get("confidence", 0.5)
+                label_source = "auto+llm"
+            elif news_id_str in keyword_sub_map:
+                sub, conf = keyword_sub_map[news_id_str]
+                label_source = "keyword+llm"
+            else:
+                sub = r.get("sub", "")
+                conf = r.get("confidence", 0.5)
+                label_source = "llm"
+            if sub in sub_to_major:
+                llm_batch_results.append(
+                    Level2LabelResult(
+                        news_id=batch[j]["news_id"],
+                        title=batch[j]["title"],
+                        datetime=batch[j]["datetime"],
+                        major_category=major,
+                        sub_category=sub,
+                        sentiment=r.get("sentiment", "中性"),
+                        impact_score=r.get("impact_score", 0.5),
+                        analysis_logic=r.get("analysis", {}).get("logic", ""),
+                        key_evidence=r.get("analysis", {}).get("key_evidence", ""),
+                        expectation=r.get("analysis", {}).get("expectation", "符合预期"),
+                        confidence=conf,
+                        label_source=label_source,
+                        level1_task_id=batch[j]["task_id"],
+                        level2_task_id=current_task_id,
+                        run_id=run_id,
+                    )
+                )
+    except LLMParseError as e:
+        _dump_llm_error(
+            e,
+            level=2,
+            task_id=current_task_id,
+            run_id=run_id,
+            major=major,
+            batch_idx=batch_idx,
+            model=config.model,
+        )
+        batch_error = f"parse_failed: {e}"
+        logger.warning(f"level-2 [{major}] batch {batch_idx} parse failed (dumped to S3): {e}")
+    except InsufficientBalanceError:
+        raise
+    except Exception as e:
+        batch_error = f"error: {e}"
+        logger.warning(f"level-2 [{major}] batch {batch_idx} failed: {e}")
+
+    # Publish progress every batch (independent of checkpoint)
+    if manager:
+        manager.update_progress(
+            major,
+            batch_idx=batch_idx + 1,
+            saved_count=0,
+            tokens=batch_usage.total_tokens,
+            elapsed=batch_usage.total_time,
+            error=batch_error,
+        )
+
+    saved = 0
+    # Determine if this is the last batch for this major (thread-safe decrement)
+    is_last = False
+    if pending_counter:
+        with pending_lock:
+            pending_counter[major] -= 1
+            if pending_counter[major] == 0:
+                is_last = True
+
+    # Flush checkpoint every N batches
+    if (batch_idx + 1) % config.checkpoint_every == 0 and llm_batch_results:
+        saved = store.save_sub_labels([r.model_dump() for r in llm_batch_results], run_id)
+        if checkpoint_fn:
+            checkpoint_fn(run_id, "level2-llm", batch_idx + 1, saved)
+
+        if manager:
+            manager.update_progress(
+                major,
+                batch_idx=batch_idx + 1,
+                saved_count=saved,
+                tokens=0,
+                elapsed=0,
+                error=None,
+            )
+        llm_batch_results = []
+
+    # Always flush remaining results on last batch (covers non-checkpoint_every-aligned endings)
+    # Only do this if total_batches doesn't align with checkpoint_every (aligned batches
+    # are already handled by the checkpoint_every flush in the serial path).
+    if is_last and llm_batch_results and (total_batches % config.checkpoint_every != 0):
+        saved += store.save_sub_labels([r.model_dump() for r in llm_batch_results], run_id)
+        if checkpoint_fn:
+            checkpoint_fn(run_id, "level2-llm", batch_idx + 1, saved)
+
+    return saved, batch_usage, is_last, llm_batch_results
+
+
 def _run_level2_major(
     major: str,
     pending: list[dict],
@@ -849,20 +1001,15 @@ def _run_level2_major(
     checkpoint_fn: CheckpointFn | None,
     manager: ProgressManager | None,
 ) -> tuple[int, LLMUsage]:
-    """Process all batches for a single major category. Used by both serial and parallel paths.
-
-    Args:
-        manager: Optional ProgressManager for real-time progress updates.
+    """Process all batches for a single major category (serial path).
 
     Returns (total_saved, llm_usage).
     """
-    batch_count = 0
-    batch_usage = LLMUsage()
-
     total_batches = -(-len(pending) // config.batch_size)
     llm_usage = LLMUsage()
-    llm_batch_results: list[Level2LabelResult] = []
     total_saved = 0
+    # Accumulate remaining results for final flush (non-aligned endings)
+    remaining_accum: list[Level2LabelResult] = []
 
     # Emit init message for this major
     if manager:
@@ -870,118 +1017,35 @@ def _run_level2_major(
 
     for i in range(0, len(pending), config.batch_size):
         batch = pending[i : i + config.batch_size]
-        batch_error: str | None = None
+        batch_idx = i // config.batch_size
 
-        try:
-            titles = [r["title"] for r in batch]
-            batch_contents = [r.get("content") for r in batch]
-            logger.info(f"Processing batch [{batch_count}/{total_batches}] for major [{major}] with {len(batch)} items")
+        # Serial path: pass empty counter/lock (is_last never triggers)
+        saved, batch_usage, _is_last, rem_results = _run_level2_batch(
+            major=major,
+            batch=batch,
+            batch_idx=batch_idx,
+            total_batches=total_batches,
+            client=client,
+            config=config,
+            keyword_sub_map=keyword_sub_map,
+            sub_to_major=sub_to_major,
+            current_task_id=current_task_id,
+            run_id=run_id,
+            store=store,
+            checkpoint_fn=checkpoint_fn,
+            manager=manager,
+            pending_counter={},
+            pending_lock=threading.Lock(),
+        )
+        llm_usage.add(batch_usage)
+        total_saved += saved
+        remaining_accum.extend(rem_results)
 
-            results, usage = _llm_classify_level2(
-                client,
-                titles,
-                major,
-                config,
-                contents=batch_contents,
-                batch_idx=batch_count,
-            )
-
-            batch_usage = usage
-            llm_usage.add(batch_usage)
-            logger.info(
-                f"  level-2 [{major}] batch={batch_count}/{total_batches} — "
-                f"prompt={batch_usage.prompt_tokens:,} completion={batch_usage.completion_tokens:,} "
-                f"total={batch_usage.total_tokens:,} time={batch_usage.total_time:.2f}s"
-            )
-
-            for j, r in enumerate(results):
-                if j < len(batch):
-                    news_id_str = str(batch[j]["news_id"])
-                    # Determine sub_category and label_source
-                    if major in _single_sub_majors:
-                        sub = _single_sub_majors[major]
-                        conf = r.get("confidence", 0.5)
-                        label_source = "auto+llm"
-                    elif news_id_str in keyword_sub_map:
-                        sub, conf = keyword_sub_map[news_id_str]
-                        label_source = "keyword+llm"
-                    else:
-                        sub = r.get("sub", "")
-                        conf = r.get("confidence", 0.5)
-                        label_source = "llm"
-                    if sub in sub_to_major:
-                        llm_batch_results.append(
-                            Level2LabelResult(
-                                news_id=batch[j]["news_id"],
-                                title=batch[j]["title"],
-                                datetime=batch[j]["datetime"],
-                                major_category=major,
-                                sub_category=sub,
-                                sentiment=r.get("sentiment", "中性"),
-                                impact_score=r.get("impact_score", 0.5),
-                                analysis_logic=r.get("analysis", {}).get("logic", ""),
-                                key_evidence=r.get("analysis", {}).get("key_evidence", ""),
-                                expectation=r.get("analysis", {}).get("expectation", "符合预期"),
-                                confidence=conf,
-                                label_source=label_source,
-                                level1_task_id=batch[j]["task_id"],
-                                level2_task_id=current_task_id,
-                                run_id=run_id,
-                            )
-                        )
-        except LLMParseError as e:
-            _dump_llm_error(
-                e,
-                level=2,
-                task_id=current_task_id,
-                run_id=run_id,
-                major=major,
-                batch_idx=batch_count,
-                model=config.model,
-            )
-            batch_error = f"parse_failed: {e}"
-            logger.warning(f"level-2 [{major}] batch {batch_count} parse failed (dumped to S3): {e}")
-        except InsufficientBalanceError:
-            raise
-        except Exception as e:
-            batch_error = f"error: {e}"
-            logger.warning(f"level-2 [{major}] batch {batch_count} failed: {e}")
-        batch_count += 1
-
-        # Publish progress every batch (independent of checkpoint)
-        if manager:
-            manager.update_progress(
-                major,
-                batch_idx=batch_count,
-                saved_count=0,
-                tokens=batch_usage.total_tokens,
-                elapsed=batch_usage.total_time,
-                error=batch_error,
-            )
-
-        # Flush checkpoint every N batches
-        if batch_count % config.checkpoint_every == 0 and llm_batch_results:
-            saved = store.save_sub_labels([r.model_dump() for r in llm_batch_results], run_id)
-            if checkpoint_fn:
-                checkpoint_fn(run_id, "level2-llm", batch_count, saved)
-            total_saved += saved
-            llm_batch_results = []
-
-            if manager:
-                manager.update_progress(
-                    major,
-                    batch_idx=batch_count,
-                    saved_count=saved,
-                    tokens=0,
-                    elapsed=0,
-                    error=None,
-                )
-
-    # Flush remaining LLM results
-    if llm_batch_results:
-        saved = store.save_sub_labels([r.model_dump() for r in llm_batch_results], run_id)
+    # Final flush for non-checkpoint_every-aligned endings (serial path)
+    if total_batches % config.checkpoint_every != 0 and remaining_accum:
+        saved = store.save_sub_labels([r.model_dump() for r in remaining_accum], run_id)
         if checkpoint_fn:
-            checkpoint_fn(run_id, "level2-llm", batch_count, saved)
+            checkpoint_fn(run_id, "level2-llm", total_batches, saved)
         total_saved += saved
 
     if manager:
@@ -1018,14 +1082,12 @@ def run_level2(
     assert config.level1_task_id, "level1_task_id must be specified in config for level-2"
     source_task_id = config.level1_task_id
 
-    # Determine effective concurrency
-    majors_count = len(config.major_categories) if config.major_categories else len(all_major_categories)
-    effective_concurrency = config.concurrency
-    if effective_concurrency > majors_count:
-        logger.warning(
-            f"concurrency={effective_concurrency} > number of majors ({majors_count}), downgrading to {majors_count}"
-        )
-        effective_concurrency = majors_count
+    # Determine effective concurrency (capped by available CPU cores)
+    try:
+        max_concurrency = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        max_concurrency = os.cpu_count() or 4
+    effective_concurrency = min(config.concurrency, max_concurrency)
 
     # Build WHERE clause for major_categories filter
     major_filter = ""
@@ -1111,38 +1173,85 @@ def run_level2(
             logger.info(f"Completed major [{major}]: saved={saved}")
             time.sleep(0.5)
     else:
-        # Parallel path using ThreadPoolExecutor
+        # Parallel path: batch-level dispatch for true load balancing
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        majors = list(llm_pending_by_major.keys())
+        # Pre-compute all batches per major: major -> list of (batch_idx, batch_items)
+        majors_to_batches: dict[str, list[tuple[int, list[dict]]]] = {}
+        for major, pending in llm_pending_by_major.items():
+            batches = []
+            for i in range(0, len(pending), config.batch_size):
+                batch_items = pending[i : i + config.batch_size]
+                batch_idx = i // config.batch_size
+                batches.append((batch_idx, batch_items))
+            majors_to_batches[major] = batches
 
+        # Initialize all majors upfront and set up atomic countdown counters
+        pending_counter: dict[str, int] = {}
+        pending_lock = threading.Lock()
+        major_total_saved: dict[str, int] = {}
+        major_total_usage: dict[str, LLMUsage] = {}
+
+        for major, batches in majors_to_batches.items():
+            total_batches = len(batches)
+            pending_counter[major] = total_batches
+            major_total_saved[major] = 0
+            major_total_usage[major] = LLMUsage()
+            if manager:
+                manager.init_major(major, total_batches=total_batches)
+
+        # Submit all batch tasks
         with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
-            futures = {
-                executor.submit(
-                    _run_level2_major,
-                    major,
-                    llm_pending_by_major[major],
-                    client,
-                    config,
-                    keyword_sub_map,
-                    current_task_id,
-                    run_id,
-                    store,
-                    checkpoint_fn,
-                    manager,
-                ): major
-                for major in majors
-            }
+            futures = {}
+            for major, batches in majors_to_batches.items():
+                total_batches = len(batches)
+                for batch_idx, batch_items in batches:
+                    future = executor.submit(
+                        _run_level2_batch,
+                        major=major,
+                        batch=batch_items,
+                        batch_idx=batch_idx,
+                        total_batches=total_batches,
+                        client=client,
+                        config=config,
+                        keyword_sub_map=keyword_sub_map,
+                        sub_to_major=sub_to_major,
+                        current_task_id=current_task_id,
+                        run_id=run_id,
+                        store=store,
+                        checkpoint_fn=checkpoint_fn,
+                        manager=manager,
+                        pending_counter=pending_counter,
+                        pending_lock=pending_lock,
+                    )
+                    futures[future] = (major, batch_idx)
 
+            # Collect results; last batch for each major calls finalize
             for future in as_completed(futures):
-                major = futures[future]
+                major, batch_idx = futures[future]
                 try:
-                    saved, usage = future.result()
+                    saved, batch_usage, is_last, _rem = future.result()
                     total_saved += saved
-                    llm_usage.add(usage)
-                    logger.info(f"Completed major [{major}]: saved={saved}")
+
+                    with pending_lock:
+                        major_total_saved[major] += saved
+                        major_total_usage[major].add(batch_usage)
+
+                    if is_last:
+                        if manager:
+                            manager.finalize(
+                                major,
+                                total_saved=major_total_saved[major],
+                                total_tokens=major_total_usage[major].total_tokens,
+                                total_time=major_total_usage[major].total_time,
+                            )
+                        logger.info(f"Completed major [{major}]: saved={major_total_saved[major]}")
                 except Exception as e:
-                    logger.error(f"Major [{major}] failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    logger.error(f"Batch [{major}][{batch_idx}] failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+        llm_usage = LLMUsage()
+        for usage in major_total_usage.values():
+            llm_usage.add(usage)
 
     # D: reverse validation — sample 5% of keyword results and verify with LLM
     if keyword_results:
