@@ -7,6 +7,7 @@ Stores:
 
 import polars as pl
 from clickhouse_connect import get_client
+from loguru import logger
 from rich.console import Console
 
 from src.common import DATA_DIR, get_config
@@ -114,11 +115,11 @@ class ClickHouseStore:
         if count > 0:
             return count
 
-        console.print("[bold cyan]First run: importing news data into ClickHouse...[/bold cyan]")
+        logger.info("First run: importing news data into ClickHouse...")
         parquet_dir = DATA_DIR / "converted"
 
         for f in sorted(parquet_dir.glob("tushare_news_*.parquet")):
-            console.print(f"  importing [cyan]{f.name}[/cyan]...")
+            logger.info(f"  importing {f.name}...")
             df = pl.read_parquet(f)
             df = df.filter(pl.col("datetime").is_not_null() | pl.col("title").is_not_null())
             df = df.with_columns(
@@ -129,7 +130,7 @@ class ClickHouseStore:
                 client.insert("news_raw", records)
 
         count = client.query("SELECT COUNT(*) FROM news_raw").result_rows[0][0]
-        console.print(f"  imported [bold]{count}[/bold] records")
+        logger.info(f"  imported {count} records")
         return count
 
     def sample_unlabeled(self, n: int) -> pl.DataFrame:

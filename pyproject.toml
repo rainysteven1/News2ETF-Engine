@@ -31,6 +31,8 @@ platform = [
     "boto3>=1.35.0",
     "clickhouse-connect>=0.14.1",
     "json-repair>=0.58.6",
+    "redis>=5.0.0",
+    "jsonschema>=4.26.0",
 ]
 dev = ["ruff>=0.15.5", "uv>=0.10.12"]
 finbert = ["wandb>=0.25.0", "transformers>=4.40.0", "scikit-learn>=1.8.0"]

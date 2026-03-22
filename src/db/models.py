@@ -46,6 +46,7 @@ class Run(Base):
     run_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending", index=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -13,6 +13,10 @@ database = "default"
 user = "default"
 password = "default"
 
+[redis]
+host = "localhost"
+port = 46379
+
 [loki]
 url = "http://localhost:43100"
 

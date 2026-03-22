@@ -37,6 +37,7 @@ class RunResponse(BaseModel):
     run_number: int
     status: str
     result: dict[str, Any] | None
+    summary: dict[str, Any] | None
     error_msg: str | None
     started_at: datetime | None
     finished_at: datetime | None

@@ -18,9 +18,10 @@ from src.db import Task
 from src.db.models import TaskCheckpoint
 from src.db.store import store as clickhouse_store
 from src.experiment.manager import ExperimentManager
-from src.labeling import Level1Config, Level2Config, run_level1, run_level2
+from src.labeling import Level1Config, Level2Config, LLMUsage, run_level1, run_level2
 from src.utils.llm_client import get_llm_client
 from src.utils.loki_sink import LokiSink
+from src.utils.progress_manager import ProgressManager
 
 
 def _setup_loki(run_id: str | None, level_stage: str) -> tuple[LokiSink | None, int | None]:
@@ -68,8 +69,29 @@ def _teardown_loki(sink: LokiSink | None, handler_id: int | None) -> None:
         logger.remove(handler_id)
 
 
-def _build_summary(store, task_uuid_str: str, level: int) -> dict:
-    """Query store and build a structured result summary for the task record."""
+def _build_llm_usage_summary(llm_usage: LLMUsage | None) -> dict[str, Any] | None:
+    """Build a summary dict from LLMUsage, or None if not available."""
+    if llm_usage is None:
+        return None
+    return {
+        "total_tokens": llm_usage.total_tokens,
+        "prompt_tokens": llm_usage.prompt_tokens,
+        "completion_tokens": llm_usage.completion_tokens,
+        "cached_tokens": llm_usage.cached_tokens,
+        "batches": llm_usage.batches,
+        "total_time": llm_usage.total_time,
+    }
+
+
+def _build_summary(store, task_uuid_str: str, level: int, llm_usage: LLMUsage | None = None) -> dict:
+    """Query store and build a structured result summary for the task record.
+
+    Args:
+        store: ClickHouse store instance.
+        task_uuid_str: The task UUID as a string.
+        level: 1 or 2 for labeling level.
+        llm_usage: Optional LLMUsage object to include in the summary.
+    """
     if level == 1:
         rows = store.execute(
             """
@@ -91,6 +113,7 @@ def _build_summary(store, task_uuid_str: str, level: int) -> dict:
         return {
             "by_label_source": by_source,
             "by_major_category": by_major,
+            "summary": _build_llm_usage_summary(llm_usage),
         }
     else:
         rows = store.execute(
@@ -119,6 +142,7 @@ def _build_summary(store, task_uuid_str: str, level: int) -> dict:
             "by_label_source": by_source,
             "by_sub_category": by_sub,
             "by_sentiment": by_sentiment,
+            "summary": _build_llm_usage_summary(llm_usage),
         }
 
 
@@ -214,26 +238,32 @@ class LabelingTaskExecutor(TaskExecutor):
         assert run_id is not None, "run_id must be provided for labeling tasks"
         checkpoint_fn = self._make_checkpoint_fn(run_id)
 
+        # Create progress manager that publishes to Redis SSE stream
+        manager = ProgressManager(run_id)
+
+        llm_usage: LLMUsage | None = None
         try:
             if level == 1:
                 assert isinstance(config, Level1Config)
-                run_level1(
+                llm_usage = run_level1(
                     client,
                     config=config,
                     store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
                     checkpoint_fn=checkpoint_fn,
+                    manager=manager,
                 )
             else:
                 assert isinstance(config, Level2Config)
-                run_level2(
+                llm_usage = run_level2(
                     client,
                     config=config,
                     store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
                     checkpoint_fn=checkpoint_fn,
+                    manager=manager,
                 )
 
             # Get total count
@@ -247,7 +277,10 @@ class LabelingTaskExecutor(TaskExecutor):
                     {"task_id": task_uuid_str},
                 )[0][0]
 
-            summary = _build_summary(self.store, task_uuid_str, level)
+            summary = _build_summary(self.store, task_uuid_str, level, llm_usage)
+            # result stores distribution data (by_label_source, by_sentiment, etc.)
+            # summary stores LLMUsage data (separate column)
+            result_data = {k: v for k, v in summary.items() if k != "summary"}
             return {
                 "status": "success",
                 "message": f"Task completed: {total} labels created",
@@ -258,7 +291,8 @@ class LabelingTaskExecutor(TaskExecutor):
                     **config.model_dump(),
                     "s3_bucket": get_config().labeling.s3_bucket,
                 },
-                **summary,
+                "result": result_data,
+                "summary": summary.get("summary"),
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "total_labeled": 0, "run_id": run_id}

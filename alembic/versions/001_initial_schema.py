@@ -58,6 +58,7 @@ def upgrade() -> None:
         sa.Column("run_number", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(50), nullable=False),
         sa.Column("result", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("summary", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("error_msg", sa.Text(), nullable=True),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),

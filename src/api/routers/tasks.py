@@ -73,8 +73,11 @@ def _execute_task(run_id: str, executor: Any) -> None:
         result = executor.execute(task, run_id=run.run_id)
         final = TaskStatus.COMPLETED if result.get("status") == "success" else TaskStatus.FAILED
         err = None if final == TaskStatus.COMPLETED else result.get("message", "Unknown error")
+        # Extract result (distribution data) and summary (LLMUsage) separately
+        result_data = result.get("result")
+        summary = result.get("summary")
         with ExperimentManager() as mgr:
-            mgr.update_run(run_id, final, result=result, error_msg=err)
+            mgr.update_run(run_id, final, result=result_data, summary=summary, error_msg=err)
     except Exception as exc:
         with ExperimentManager() as mgr:
             mgr.update_run(run_id, TaskStatus.FAILED, error_msg=str(exc))
