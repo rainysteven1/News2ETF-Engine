@@ -320,6 +320,126 @@ def restart_run(run_id: str, background_tasks: BackgroundTasks) -> TaskRunAccept
     return TaskRunAccepted(task_id=str(task.task_id), run_id=new_run.run_id)
 
 
+# ── Run result distribution ────────────────────────────────────────────────────
+
+
+@router.get("/runs/{run_id}/distribution")
+def get_distribution(run_id: str) -> dict:
+    """Get classification distribution for a completed run.
+
+    Returns the distribution of labels from news_classified (level-1) or
+    news_sub_classified (level-2) depending on the task configuration.
+    Only returns results when run status is COMPLETED.
+    """
+    from src.db.store import duckdb_store
+
+    if not duckdb_store.db_path.exists():
+        raise HTTPException(status_code=503, detail="DuckDB not initialised.")
+
+    # 1. Get run and task info
+    with ExperimentManager() as mgr:
+        run = mgr.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        if run.status != TaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run is not completed. Current status: {run.status}",
+            )
+        task = mgr.get_task(run.task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task not found for run: {run_id}")
+
+    task_type = task.task_type
+    cfg = task.config or {}
+    level = cfg.get("level", 1)
+    task_uuid_str = str(task.task_id)
+
+    con = duckdb_store.connect(read_only=True)
+    try:
+        if task_type == "labeling" and level == 1:
+            rows = con.execute(
+                """
+                SELECT major_category, label_source, COUNT(*) AS cnt,
+                       ROUND(AVG(confidence), 3) AS avg_conf
+                FROM news_classified
+                WHERE task_id = ? AND run_id = ?
+                GROUP BY major_category, label_source
+                ORDER BY major_category, label_source
+                """,
+                [task_uuid_str, run_id],
+            ).fetchall()
+
+            if not rows:
+                raise HTTPException(status_code=404, detail=f"No level-1 results found for run_id: {run_id}")
+
+            by_source: dict = {}
+            by_major: dict = {}
+            total = 0
+            for major, source, cnt, avg_conf in rows:
+                total += cnt
+                by_source[source] = by_source.get(source, 0) + cnt
+                by_major.setdefault(major or "unknown", {})[source] = {
+                    "count": cnt,
+                    "avg_confidence": avg_conf,
+                }
+
+            return {
+                "run_id": run_id,
+                "task_id": task_uuid_str,
+                "level": 1,
+                "total": total,
+                "by_label_source": by_source,
+                "by_major_category": by_major,
+            }
+
+        elif task_type == "labeling" and level == 2:
+            rows = con.execute(
+                """
+                SELECT major_category, sub_category, label_source,
+                       sentiment, COUNT(*) AS cnt,
+                       ROUND(AVG(confidence), 3) AS avg_conf
+                FROM news_sub_classified
+                WHERE level2_task_id = ? AND run_id = ?
+                GROUP BY major_category, sub_category, label_source, sentiment
+                ORDER BY major_category, sub_category
+                """,
+                [task_uuid_str, run_id],
+            ).fetchall()
+
+            if not rows:
+                raise HTTPException(status_code=404, detail=f"No level-2 results found for run_id: {run_id}")
+
+            by_source: dict = {}
+            by_sub: dict = {}
+            by_sentiment: dict = {}
+            total = 0
+            for major, sub, source, sentiment, cnt, avg_conf in rows:
+                total += cnt
+                by_source[source] = by_source.get(source, 0) + cnt
+                key = f"{major} / {sub}"
+                by_sub.setdefault(key, {})[source] = {"count": cnt, "avg_confidence": avg_conf}
+                if sentiment:
+                    by_sentiment[sentiment] = by_sentiment.get(sentiment, 0) + cnt
+
+            return {
+                "run_id": run_id,
+                "task_id": task_uuid_str,
+                "level": 2,
+                "total": total,
+                "by_label_source": by_source,
+                "by_sub_category": by_sub,
+                "by_sentiment": by_sentiment,
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported task_type='{task_type}' level={level} for result.",
+            )
+    finally:
+        con.close()
+
+
 # ── Export ─────────────────────────────────────────────────────────────────────
 
 

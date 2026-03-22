@@ -6,6 +6,9 @@ user = "news2etf"
 password = "news2etf_password"
 db = "news2etf"
 
+[duckdb]
+path = "data/news2etf-docker.duckdb"
+
 [loki]
 url = "http://loki:3100"
 

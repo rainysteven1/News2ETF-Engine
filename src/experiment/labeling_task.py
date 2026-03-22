@@ -199,6 +199,7 @@ class LabelingTaskExecutor(TaskExecutor):
             config = Level2Config(
                 **_common,
                 level1_task_id=cfg.get("level1_task_id", ""),
+                major_categories=cfg.get("major_categories"),
             )
 
         try:

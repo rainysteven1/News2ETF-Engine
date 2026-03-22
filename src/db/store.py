@@ -12,7 +12,7 @@ import duckdb
 import polars as pl
 from rich.console import Console
 
-from src.common import DATA_DIR
+from src.common import DATA_DIR, get_config
 
 console = Console()
 
@@ -22,16 +22,16 @@ class DuckDBStore:
 
     _instance = None
 
-    def __new__(cls, db_path: Path | None = None):
+    def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self):
         if self._initialized:
             return
-        self.db_path = db_path or DATA_DIR / "news2etf.duckdb"
+        self.db_path = Path(get_config().duckdb.path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialized = True
 
@@ -60,10 +60,17 @@ class DuckDBStore:
                     confidence     FLOAT,
                     label_source   VARCHAR,
                     task_id        VARCHAR,
+                    run_id         VARCHAR,
                     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (news_id, task_id)
+                    PRIMARY KEY (news_id, task_id, run_id)
                 )
             """)
+            # Migrate existing news_classified if run_id column is missing
+            try:
+                con.execute("ALTER TABLE news_classified ADD COLUMN run_id VARCHAR")
+            except Exception:
+                pass  # Column already exists
+
             con.execute("""
                 CREATE TABLE IF NOT EXISTS news_sub_classified (
                     news_id          VARCHAR,
@@ -158,7 +165,7 @@ class DuckDBStore:
             LIMIT {n} OFFSET {offset}
         """).pl()
 
-    def save_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict]) -> int:
+    def save_labels(self, con: duckdb.DuckDBPyConnection, labels: list[dict], run_id: str | None = None) -> int:
         """Insert level-1 label rows into news_classified; silently skip duplicates."""
         if not labels:
             return 0
@@ -175,12 +182,15 @@ class DuckDBStore:
                 for r in labels
             ]
         )  # noqa: F841
-        con.execute("""
+        con.execute(
+            """
             INSERT OR IGNORE INTO news_classified
-                (news_id, title, major_category, confidence, label_source, task_id)
-            SELECT news_id, title, major_category, confidence, label_source, task_id
+                (news_id, title, major_category, confidence, label_source, task_id, run_id)
+            SELECT news_id, title, major_category, confidence, label_source, task_id, ?
             FROM df
-        """)
+            """,
+            [run_id],
+        )
         con.commit()
         return len(labels)
 

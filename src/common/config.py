@@ -55,11 +55,16 @@ class LabelingConfig(BaseModel):
     llm_retry: int = 2
 
 
+class DuckDBConfig(BaseModel):
+    path: str = "data/news2etf.duckdb"
+
+
 class AppConfig(BaseModel):
     database: DatabaseConfig = DatabaseConfig()
     loki: LokiConfig = LokiConfig()
     s3: S3Config = S3Config()
     labeling: LabelingConfig = LabelingConfig()
+    duckdb: DuckDBConfig = DuckDBConfig()
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────

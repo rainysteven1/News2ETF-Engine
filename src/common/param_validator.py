@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -181,6 +182,18 @@ def _validate_model_env_var(params: dict[str, Any], rule: ValidationRule) -> tup
     return True, None
 
 
+def _get_industry_major_categories() -> list[str]:
+    """Load major categories from industry_dict.json."""
+    import json
+
+    path = Path(__file__).parent.parent.parent / "data" / "industry_dict.json"
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return list(data.keys())
+
+
 @register_hook("labeling", "validate_level1_task_id")
 def _validate_level1_task_id(params: dict[str, Any], rule: ValidationRule) -> tuple[bool, str | None]:
     """Hook: level=2 requires a valid level1_task_id that points to a level-1 labeling task.
@@ -236,6 +249,24 @@ def _validate_level1_task_id(params: dict[str, Any], rule: ValidationRule) -> tu
             return True, None
 
     return False, f"level1_task_id not found: {level1_task_id}"
+
+
+@register_hook("labeling", "validate_major_categories")
+def _validate_major_categories(params: dict[str, Any], rule: ValidationRule) -> tuple[bool, str | None]:
+    """Hook: major_categories (if provided) must be a list of values from industry_dict.json."""
+    major_categories = params.get("major_categories")
+    if major_categories is None:
+        return True, None  # optional field
+
+    if not isinstance(major_categories, list):
+        return False, f"major_categories must be a list, got {type(major_categories).__name__}"
+
+    valid_majors = set(_get_industry_major_categories())
+    invalid = [c for c in major_categories if c not in valid_majors]
+    if invalid:
+        return False, f"Unknown major_categories: {invalid}. Valid ones: {sorted(valid_majors)}"
+
+    return True, None
 
 
 # ── Validator class ────────────────────────────────────────────────────────────
