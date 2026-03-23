@@ -35,7 +35,7 @@ platform = [
     "jsonschema>=4.26.0",
 ]
 dev = ["ruff>=0.15.5", "uv>=0.10.12"]
-finbert = ["wandb>=0.25.0", "transformers>=4.40.0", "scikit-learn>=1.8.0"]
+finbert = ["wandb>=0.25.0", "transformers==4.38.2", "scikit-learn>=1.8.0"]
 torch_cpu = ["torch==2.1.0+cpu", "torchvision==0.16.0+cpu"]
 torch_gpu = ["torch==2.1.0", "torchvision==0.16.0"]
 

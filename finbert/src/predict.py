@@ -17,9 +17,9 @@ from loguru import logger
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from finbert.dataset import NewsInferenceDataset
-from finbert.hierarchy import build_l1_to_l2_indices, build_label_maps
-from finbert.model import FinBERTHierarchicalClassifier
+from src.dataset import NewsInferenceDataset
+from src.hierarchy import build_l1_to_l2_indices, build_label_maps
+from src.model import FinBERTHierarchicalClassifier
 
 SENTIMENT_LABELS = {0: "negative", 1: "neutral", 2: "positive"}
 

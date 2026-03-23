@@ -22,8 +22,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
-
-from finbert.config import FinBERTConfig, load_config
+from src.config import FinBERTConfig, load_config
 
 app = typer.Typer(
     name="finbert",
@@ -60,7 +59,7 @@ def train(
     config: _ConfigOpt = _DEFAULT_CONFIG,
 ) -> None:
     """Train the FinBERT hierarchical classifier using settings from config.toml."""
-    from finbert.train import train as _train
+    from src.train import train as _train
 
     cfg = _load(config)
     _print_config_table(
@@ -82,7 +81,7 @@ def predict(
     config: _ConfigOpt = _DEFAULT_CONFIG,
 ) -> None:
     """Run batch inference on an unlabeled parquet file using settings from config.toml."""
-    from finbert.predict import predict as _predict
+    from src.predict import predict as _predict
 
     cfg = _load(config)
     icfg = cfg.inference

@@ -33,7 +33,9 @@ class LossConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     batch_size: int = 64
-    learning_rate: float = 2e-5
+    learning_rate: float = 2e-5  # Default LR (used if bert_lr/heads_lr not set)
+    bert_lr: float = 2e-5  # Learning rate for BERT backbone
+    heads_lr: float = 1e-4  # Learning rate for classification heads
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     num_epochs: int = 5
@@ -45,19 +47,19 @@ class TrainingConfig(BaseModel):
 
 class DataConfig(BaseModel):
     data_dir: Path = _ROOT / "data" / "labeled"
-    train_file: str = "train.parquet"
-    val_file: str = "val.parquet"
-    test_file: str = "test.parquet"
+    train_raw_file: str = "raw.parquet"  # original labeled data, will be split into train/val
+    val_ratio: float = 0.1  # proportion of raw data to use as validation split
+    test_file: str = "test.parquet"  # separate test file used only for inference
 
 
 class OutputConfig(BaseModel):
-    output_dir: Path = _ROOT / "finbert" / "checkpoints"
+    output_dir: Path = _ROOT / "checkpoints"
     log_steps: int = 50
     eval_steps: int = 200
 
 
 class InferenceConfig(BaseModel):
-    checkpoint_dir: Path = _ROOT / "finbert" / "checkpoints" / "best"
+    checkpoint_dir: Path = _ROOT / "checkpoints" / "best"
     input_file: Path = _ROOT / "data" / "converted" / "tushare_news_2021_today_part1.parquet"
     output_file: Path = _ROOT / "data" / "classified.parquet"
     infer_batch_size: int = 256

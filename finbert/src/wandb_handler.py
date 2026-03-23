@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 import wandb
-from finbert.config import FinBERTConfig
+from src.config import FinBERTConfig
 
 
 def _make_run_name(cfg: FinBERTConfig) -> str:
@@ -62,8 +62,11 @@ class WandbHandler:
             "num_level2": cfg.hierarchy.num_level2,
             "alpha": cfg.loss.alpha,
             "beta": cfg.loss.beta,
+            "gamma": cfg.loss.gamma,
             "batch_size": cfg.training.batch_size,
             "learning_rate": cfg.training.learning_rate,
+            "bert_lr": cfg.training.bert_lr,
+            "heads_lr": cfg.training.heads_lr,
             "weight_decay": cfg.training.weight_decay,
             "warmup_ratio": cfg.training.warmup_ratio,
             "num_epochs": cfg.training.num_epochs,

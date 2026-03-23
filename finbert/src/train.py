@@ -11,23 +11,28 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from loguru import logger
 from pydantic import BaseModel
+from torch.cuda.amp.autocast_mode import autocast
+from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.optimization import get_linear_schedule_with_warmup
 
-from finbert.config import FinBERTConfig
-from finbert.dataset import NewsClassificationDataset
-from finbert.hierarchy import build_label_maps
-from finbert.model import load_finbert_classifier
-from finbert.wandb_handler import WandbHandler
+from src.config import FinBERTConfig
+from src.dataset import NewsClassificationDataset, preprocess_split
+from src.hierarchy import build_label_maps
+from src.model import load_finbert_classifier
+from src.wandb_handler import WandbHandler
 
 
 class EvalMetrics(BaseModel):
@@ -133,6 +138,18 @@ def train(cfg: FinBERTConfig) -> None:
     wb = WandbHandler(cfg)
     wb.init_run()
 
+    # Override output_dir to use wandb run ID for checkpoint storage
+    run_output_dir = ocfg.output_dir / (wb.run_id or "unknown")
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Add loguru file sink: write all logs to run_output_dir / "train.log"
+    log_file = run_output_dir / "train.log"
+    logger.remove()  # Remove default sink
+    logger.add(sys.stderr, level="INFO")  # Keep console output
+    logger.add(log_file, level="DEBUG", rotation="50 MB", retention="10 days", enqueue=True)
+
+    logger.info(f"Checkpoint output: {run_output_dir}")
+
     # ── Label maps ─────────────────────────────────────
     l1_to_idx, idx_to_l1, l2_to_idx, idx_to_l2, _ = build_label_maps()
     assert len(l1_to_idx) == hcfg.num_level1, f"Hierarchy has {len(l1_to_idx)} L1, config expects {hcfg.num_level1}"
@@ -142,15 +159,16 @@ def train(cfg: FinBERTConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(mcfg.pretrained_model)
 
     # ── Datasets ───────────────────────────────────────
+    preprocess_split(dcfg.data_dir / dcfg.train_raw_file, dcfg.data_dir, dcfg.val_ratio, tcfg.seed)
     train_ds = NewsClassificationDataset(
-        dcfg.data_dir / dcfg.train_file,
+        dcfg.data_dir / "train.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=l1_to_idx,
         l2_to_idx=l2_to_idx,
     )
     val_ds = NewsClassificationDataset(
-        dcfg.data_dir / dcfg.val_file,
+        dcfg.data_dir / "val.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=l1_to_idx,
@@ -171,32 +189,48 @@ def train(cfg: FinBERTConfig) -> None:
         alpha=lcfg.alpha,
         beta=lcfg.beta,
         gamma=lcfg.gamma,
+        bert_lr=tcfg.bert_lr,
+        heads_lr=tcfg.heads_lr,
     )
     model.to(device)  # type: ignore
 
     # ── Optimizer & Scheduler ──────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias"}
+
+    # Separate param groups with different learning rates for BERT vs heads
+    bert_params_decay = []
+    bert_params_no_decay = []
+    heads_params_decay = []
+    heads_params_no_decay = []
+
+    for n, p in model.named_parameters():
+        if not any(nd in n for nd in no_decay):
+            if "bert." in n:
+                bert_params_decay.append(p)
+            else:
+                heads_params_decay.append(p)
+        else:
+            if "bert." in n:
+                bert_params_no_decay.append(p)
+            else:
+                heads_params_no_decay.append(p)
+
     params = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": tcfg.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
+        {"params": bert_params_decay, "lr": tcfg.bert_lr, "weight_decay": tcfg.weight_decay},
+        {"params": bert_params_no_decay, "lr": tcfg.bert_lr, "weight_decay": 0.0},
+        {"params": heads_params_decay, "lr": tcfg.heads_lr, "weight_decay": tcfg.weight_decay},
+        {"params": heads_params_no_decay, "lr": tcfg.heads_lr, "weight_decay": 0.0},
     ]
-    optimizer = AdamW(params, lr=tcfg.learning_rate)
+    optimizer = AdamW(params)
 
     total_steps = len(train_loader) * tcfg.num_epochs // tcfg.grad_accum_steps
     warmup_steps = int(total_steps * tcfg.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     # ── Mixed precision ────────────────────────────────
-    scaler = torch.amp.GradScaler("cuda", enabled=tcfg.fp16 and device.type == "cuda")
+    scaler = GradScaler(enabled=tcfg.fp16 and device.type == "cuda")
 
     # ── Training loop ──────────────────────────────────
-    ocfg.output_dir.mkdir(parents=True, exist_ok=True)
     best_val_l2_acc = 0.0
     global_step = 0
 
@@ -208,7 +242,7 @@ def train(cfg: FinBERTConfig) -> None:
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast("cuda", enabled=tcfg.fp16 and device.type == "cuda"):
+            with autocast(enabled=tcfg.fp16 and device.type == "cuda"):
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -219,7 +253,7 @@ def train(cfg: FinBERTConfig) -> None:
                 )
                 loss = outputs["loss"] / tcfg.grad_accum_steps
 
-            scaler.scale(loss).backward()
+            scaler.scale(loss).backward()  # type: ignore
 
             if (step + 1) % tcfg.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -271,7 +305,7 @@ def train(cfg: FinBERTConfig) -> None:
                 )
                 if val_metrics.l2_accuracy > best_val_l2_acc:
                     best_val_l2_acc = val_metrics.l2_accuracy
-                    save_dir = ocfg.output_dir / "best"
+                    save_dir = run_output_dir / "best"
                     model.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
                     logger.success(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
@@ -299,13 +333,13 @@ def train(cfg: FinBERTConfig) -> None:
         )
         if val_metrics.l2_accuracy > best_val_l2_acc:
             best_val_l2_acc = val_metrics.l2_accuracy
-            save_dir = ocfg.output_dir / "best"
+            save_dir = run_output_dir / "best"
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
             logger.success(f"  ✓ New best model saved (l2_acc={best_val_l2_acc:.4f})")
 
     # ── Save final model & label maps ──────────────────
-    final_dir = ocfg.output_dir / "final"
+    final_dir = run_output_dir / "final"
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
 
@@ -315,7 +349,7 @@ def train(cfg: FinBERTConfig) -> None:
         "l2_to_idx": l2_to_idx,
         "idx_to_l2": {str(k): v for k, v in idx_to_l2.items()},
     }
-    with open(ocfg.output_dir / "label_maps.json", "w", encoding="utf-8") as f:
+    with open(run_output_dir / "label_maps.json", "w", encoding="utf-8") as f:
         json.dump(label_info, f, ensure_ascii=False, indent=2)
 
     # ── Final W&B summary & confusion matrix ───────────────────────────
@@ -336,7 +370,10 @@ def train(cfg: FinBERTConfig) -> None:
             class_names=l2_names,
             title="Level-2 Confusion Matrix",
         )
+
+    # Upload training log to W&B artifact
+    wb.log_artifact(str(log_file), name=f"train-log-{wb.run_id}", artifact_type="log")
     wb.finish()
 
     logger.info(f"\nTraining complete. Best val L2 accuracy: {best_val_l2_acc:.4f}")
-    logger.info(f"Checkpoints: {ocfg.output_dir}")
+    logger.info(f"Checkpoints: {run_output_dir}")

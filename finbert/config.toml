@@ -3,7 +3,7 @@
 
 [model]
 # HuggingFace model name or local checkpoint path
-pretrained_model = "IDEA-CCNL/Erlangshen-FinBERT-base"
+pretrained_model = "./data/pretrained_models/Erlangshen-Roberta-110M-Sentiment"
 max_seq_length = 128
 dropout = 0.1
 
@@ -19,7 +19,9 @@ gamma = 0.2 # sentiment loss weight
 
 [training]
 batch_size = 64
-learning_rate = 2e-5
+learning_rate = 2e-5     # Default LR (fallback if bert_lr/heads_lr not set)
+bert_lr = 2e-5          # Learning rate for BERT backbone
+heads_lr = 1e-4         # Learning rate for classification heads
 weight_decay = 0.01
 warmup_ratio = 0.1
 num_epochs = 5
@@ -30,19 +32,19 @@ fp16 = true
 
 [data]
 # Directory containing labeled parquet files with title / level1 / level2 / sentiment columns
-data_dir = "data/labeled"
-train_file = "train.parquet"
-val_file = "val.parquet"
-test_file = "test.parquet"
+data_dir = "./data/labeled"
+train_raw_file = "raw.parquet"   # original labeled data, will be split into train/val
+val_ratio = 0.1                  # proportion of raw data to use as validation split
+test_file = "test.parquet"       # separate test file used only for inference
 
 [output]
-output_dir = "finbert/checkpoints"
+output_dir = "./checkpoints"
 log_steps = 50
 eval_steps = 200
 save_steps = 500
 
 [inference]
-checkpoint_dir = "finbert/checkpoints/best"
+checkpoint_dir = "./checkpoints/best"
 input_file = "data/converted/tushare_news_2021_today_part1.parquet"
 output_file = "data/classified.parquet"
 infer_batch_size = 256
