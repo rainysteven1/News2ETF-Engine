@@ -1,12 +1,11 @@
 """Industry dictionary endpoints."""
 
-import os
-
 from fastapi import APIRouter, HTTPException
 from rich.console import Console
 
 from src.api.schemas import IndustryBuildRequest, IndustryBuildResponse
 from src.industry import DEFAULT_MODEL, build_industry_dict
+from src.utils.llm_client import get_llm_client
 
 router = APIRouter()
 
@@ -20,12 +19,13 @@ def build_dict(body: IndustryBuildRequest = IndustryBuildRequest()) -> IndustryB
     Requires the ZHIPU_API_KEY environment variable to be set.
     This operation calls the LLM and may take a while.
     """
-    api_key = os.environ.get("ZHIPU_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Environment variable ZHIPU_API_KEY is not set.")
+    try:
+        client = get_llm_client(body.model or DEFAULT_MODEL)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     try:
-        build_industry_dict(api_key=api_key, console=_console, model=body.model)
+        build_industry_dict(client=client, console=_console, model=body.model or DEFAULT_MODEL)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

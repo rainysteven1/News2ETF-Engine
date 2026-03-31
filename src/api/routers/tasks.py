@@ -334,7 +334,7 @@ def get_distribution(run_id: str) -> dict:
     news_sub_classified (level-2) depending on the task configuration.
     Only returns results when run status is COMPLETED.
     """
-    from src.db.store import store
+    from src.db.clickhouse import get_store as store
 
     # 1. Get run and task info
     with ExperimentManager() as mgr:
@@ -356,7 +356,7 @@ def get_distribution(run_id: str) -> dict:
     task_uuid_str = str(task.task_id)
 
     if task_type == "labeling" and level == 1:
-        rows = store.execute(
+        rows = store().execute(
             """
             SELECT major_category, label_source, COUNT(*) AS cnt,
                    round(AVG(confidence), 3) AS avg_conf
@@ -392,7 +392,7 @@ def get_distribution(run_id: str) -> dict:
         }
 
     elif task_type == "labeling" and level == 2:
-        rows = store.execute(
+        rows = store().execute(
             """
             SELECT major_category, sub_category, label_source,
                    sentiment, COUNT(*) AS cnt,
@@ -448,7 +448,7 @@ def export_task_labels(task_id: str) -> StreamingResponse:
     """
     import polars as pl
 
-    from src.db.store import store
+    from src.db.clickhouse import get_store as store
 
     # 1. Verify task exists
     with ExperimentManager() as mgr:
@@ -458,7 +458,7 @@ def export_task_labels(task_id: str) -> StreamingResponse:
     level = (task.config or {}).get("level", 1)
 
     if task_type == "labeling" and level == 1:
-        rows = store.execute(
+        rows = store().execute(
             """
             SELECT news_id, title, major_category, confidence, label_source, created_at
             FROM news_classified
@@ -476,7 +476,7 @@ def export_task_labels(task_id: str) -> StreamingResponse:
             df = pl.DataFrame(schema=["news_id", "title", "major_category", "confidence", "label_source", "created_at"])
         filename = f"level1_{task_id}.parquet"
     elif task_type == "labeling" and level == 2:
-        rows = store.execute(
+        rows = store().execute(
             """
             SELECT news_id, title, datetime, major_category, sub_category,
                    sentiment, impact_score, confidence, label_source,

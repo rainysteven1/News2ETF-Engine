@@ -63,7 +63,7 @@ class TaskExecutor(ABC):
         pass
 
     @abstractmethod
-    def execute(self, task: Task, run_id: str | None = None) -> dict[str, Any]:
+    def execute(self, task: Task, run_id: str) -> dict[str, Any]:
         """Execute the task.
 
         Args:

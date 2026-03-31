@@ -69,8 +69,7 @@ def merge_dicts(
     return base
 
 
-def build_industry_dict(api_key: str, console: Console, model: str = DEFAULT_MODEL) -> None:
-    client = OpenAI(api_key=api_key)
+def build_industry_dict(client: OpenAI, console: Console, model: str = DEFAULT_MODEL) -> None:
 
     console.print(f"[bold cyan]读取跟踪指数名称...[/bold cyan]  模型: [magenta]{model}[/magenta]")
     all_names = get_unique_index_names()

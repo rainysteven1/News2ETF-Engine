@@ -53,6 +53,7 @@ class LabelingConfig(BaseModel):
     checkpoint_every: int = 5
     s3_bucket: str = "labeling"
     llm_retry: int = 2
+    concurrency: int = 1
 
 
 class RedisConfig(BaseModel):

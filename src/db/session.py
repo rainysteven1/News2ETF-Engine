@@ -17,9 +17,6 @@ from src.db.models import Base
 
 def get_db_url() -> str:
     """Get database URL. Env var DATABASE_URL takes precedence over config.toml."""
-    env_url = os.environ.get("DATABASE_URL")
-    if env_url:
-        return env_url
     return get_config().database.url
 
 

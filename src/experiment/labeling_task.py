@@ -15,13 +15,12 @@ from src.common import get_config
 from src.common.param_metadata import TaskParamSchema
 from src.common.registry import TaskExecutor, TaskMetadata, TaskRegistry
 from src.db import Task
+from src.db.clickhouse import get_store
 from src.db.models import TaskCheckpoint
-from src.db.store import store as clickhouse_store
 from src.experiment.manager import ExperimentManager
-from src.labeling import Level1Config, Level2Config, LLMUsage, run_level1, run_level2
+from src.labeling import Level1Config, Level1Pipeline, Level2Config, Level2Pipeline, LLMUsage
 from src.utils.llm_client import get_llm_client
 from src.utils.loki_sink import LokiSink
-from src.utils.progress_manager import ProgressManager
 
 
 def _setup_loki(run_id: str | None, level_stage: str) -> tuple[LokiSink | None, int | None]:
@@ -83,7 +82,7 @@ def _build_llm_usage_summary(llm_usage: LLMUsage | None) -> dict[str, Any] | Non
     }
 
 
-def _build_summary(store, task_uuid_str: str, level: int, llm_usage: LLMUsage | None = None) -> dict:
+def _build_summary(task_uuid_str: str, level: int, llm_usage: LLMUsage | None = None) -> dict:
     """Query store and build a structured result summary for the task record.
 
     Args:
@@ -92,6 +91,8 @@ def _build_summary(store, task_uuid_str: str, level: int, llm_usage: LLMUsage | 
         level: 1 or 2 for labeling level.
         llm_usage: Optional LLMUsage object to include in the summary.
     """
+    store = get_store()
+
     if level == 1:
         rows = store.execute(
             """
@@ -159,7 +160,7 @@ class LabelingTaskExecutor(TaskExecutor):
     task_type_name = "labeling"
 
     def __init__(self) -> None:
-        self.store = clickhouse_store
+        pass
 
     @cached_property
     def metadata(self) -> TaskMetadata:
@@ -195,7 +196,7 @@ class LabelingTaskExecutor(TaskExecutor):
 
     # ── execute ─────────────────────────────────
 
-    def execute(self, task: Task, run_id: str | None = None) -> dict[str, Any]:
+    def execute(self, task: Task, run_id: str) -> dict[str, Any]:
         cfg = task.config or {}
 
         level = cfg.get("level", 1)
@@ -209,6 +210,7 @@ class LabelingTaskExecutor(TaskExecutor):
             seed=cfg.get("seed", None),
             batch_size=cfg.get("batch_size", labeling_defaults.batch_size),
             sample_size=cfg.get("sample_size", None),
+            concurrency=cfg.get("concurrency", labeling_defaults.concurrency),
         )
 
         if level == 1:
@@ -221,7 +223,6 @@ class LabelingTaskExecutor(TaskExecutor):
                 **_common,
                 level1_task_id=cfg.get("level1_task_id", ""),
                 major_categories=cfg.get("major_categories"),
-                concurrency=cfg.get("concurrency", 1),
             )
 
         try:
@@ -232,52 +233,44 @@ class LabelingTaskExecutor(TaskExecutor):
         task_uuid_str = str(task.task_id)
 
         # Set up infrastructure
-        self.store.init_db()
+        store = get_store()
         loki_sink, loki_handler = _setup_loki(run_id, level_stage=f"level{level}")
 
-        assert run_id is not None, "run_id must be provided for labeling tasks"
         checkpoint_fn = self._make_checkpoint_fn(run_id)
-
-        # Create progress manager that publishes to Redis SSE stream
-        manager = ProgressManager(run_id)
 
         llm_usage: LLMUsage | None = None
         try:
             if level == 1:
-                assert isinstance(config, Level1Config)
-                llm_usage = run_level1(
-                    client,
+                assert isinstance(config, Level1Config), "Config should be Level1Config for level 1"
+                llm_usage = Level1Pipeline(
+                    client=client,
                     config=config,
-                    store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
                     checkpoint_fn=checkpoint_fn,
-                    manager=manager,
-                )
+                ).run()
             else:
-                assert isinstance(config, Level2Config)
-                llm_usage = run_level2(
-                    client,
+                assert isinstance(config, Level2Config), "Config should be Level2Config for level 2"
+                llm_usage = Level2Pipeline(
+                    client=client,
                     config=config,
-                    store=self.store,
                     run_id=run_id,
                     task_id=task_uuid_str,
                     checkpoint_fn=checkpoint_fn,
-                    manager=manager,
-                )
+                ).run()
 
             # Get total count
-            total = self.store.execute(
+            total = store.execute(
                 "SELECT COUNT(*) FROM news_classified WHERE task_id = %(task_id)s",
                 {"task_id": task_uuid_str},
             )[0][0]
             if level == 2:
-                total = self.store.execute(
+                total = store.execute(
                     "SELECT COUNT(*) FROM news_sub_classified WHERE level2_task_id = %(task_id)s",
                     {"task_id": task_uuid_str},
                 )[0][0]
 
-            summary = _build_summary(self.store, task_uuid_str, level, llm_usage)
+            summary = _build_summary(task_uuid_str, level, llm_usage)
             # result stores distribution data (by_label_source, by_sentiment, etc.)
             # summary stores LLMUsage data (separate column)
             result_data = {k: v for k, v in summary.items() if k != "summary"}

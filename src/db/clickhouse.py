@@ -1,5 +1,5 @@
 """
-ClickHouse data store management for news data (Singleton).
+ClickHouse data store management for news data.
 
 Stores:
   - ClickHouseStore: manages news_raw and news_classified tables
@@ -16,26 +16,17 @@ console = Console()
 
 
 class ClickHouseStore:
-    """Manages ClickHouse operations for news data (Singleton)."""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+    """Manages ClickHouse operations for news data."""
 
     def __init__(self):
-        if self._initialized:
-            return
         ch_cfg = get_config().clickhouse
         self._host = ch_cfg.host
         self._port = ch_cfg.port
         self._database = ch_cfg.database
         self._user = ch_cfg.user
         self._password = ch_cfg.password
-        self._initialized = True
+
+        self._init_db()
 
     def _get_client(self):
         """Get a ClickHouse client."""
@@ -53,7 +44,7 @@ class ClickHouseStore:
         result = client.query(query, parameters=params)
         return result.result_rows
 
-    def init_db(self) -> None:
+    def _init_db(self) -> None:
         """Create core tables if they do not exist using ReplacesMergeTree engine."""
         client = self._get_client()
 
@@ -160,12 +151,15 @@ class ClickHouseStore:
         when *seed* is None — useful for continuation tasks that resume after
         a partial run.
         """
+        if n is None:
+            raise ValueError("sample_news: n (sample_size) cannot be None — set sample_size in task config")
         if seed is not None:
             result = self.execute(f"""
                 SELECT news_id, title
                 FROM news_raw
                 WHERE title IS NOT NULL AND length(title) > 5
-                SAMPLE {n}
+                ORDER BY rand({seed})
+                LIMIT {n}
             """)
         else:
             result = self.execute(f"""
@@ -179,7 +173,7 @@ class ClickHouseStore:
             return pl.DataFrame()
         return pl.DataFrame(result, schema=["news_id", "title"])
 
-    def save_labels(self, labels: list[dict], run_id: str | None = None) -> int:
+    def save_major_labels(self, labels: list[dict], run_id: str | None = None) -> int:
         """Insert level-1 label rows into news_classified; idempotent via ReplacesMergeTree."""
         if not labels:
             return 0
@@ -273,5 +267,16 @@ class ClickHouseStore:
         )
 
 
-# Global singleton instance
-store = ClickHouseStore()
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level store with lazy initialization
+# ─────────────────────────────────────────────────────────────────────────────
+
+_store: ClickHouseStore | None = None
+
+
+def get_store() -> ClickHouseStore:
+    """Return the global ClickHouse store, raising if not yet initialized."""
+    global _store
+    if _store is None:
+        _store = ClickHouseStore()
+    return _store

@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Bootstrapping LLM configuration from YAML...")
     ensure_llm_config()
+
     if SYNC_APIFOX:
         logger.info("Syncing OpenAPI schema to Apifox...")
         try:

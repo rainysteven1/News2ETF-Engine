@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import DataConvertResponse, DataLabelsResponse
 from src.common import DATA_DIR
-from src.db.store import store
+from src.db.clickhouse import get_store
 
 router = APIRouter()
 
@@ -68,7 +68,7 @@ def get_labels(
     where_clause = " AND ".join(conditions)
     query = f"SELECT * FROM news_classified WHERE {where_clause} ORDER BY created_at DESC LIMIT {limit}"
 
-    rows = store.execute(query, bind_params if bind_params else None)
+    rows = get_store().execute(query, bind_params if bind_params else None)
     if rows:
         df = pl.DataFrame(
             rows,

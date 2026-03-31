@@ -225,9 +225,9 @@ def _validate_level1_task_id(params: dict[str, Any], rule: ValidationRule) -> tu
         return True, None
 
     # Not in PostgreSQL — check ClickHouse news_classified for orphaned level-1 reference
-    from src.db.store import store as clickhouse_store
+    from src.db.clickhouse import get_store as clickhouse_store
 
-    row = clickhouse_store.execute(
+    row = clickhouse_store().execute(
         "SELECT 1 FROM news_classified WHERE task_id = %(task_id)s LIMIT 1",
         {"task_id": str(level1_task_id)},
     )
